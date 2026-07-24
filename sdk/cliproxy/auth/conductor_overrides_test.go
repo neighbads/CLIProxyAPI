@@ -67,6 +67,21 @@ func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testi
 	}
 }
 
+func TestManager_ShouldRetryAfterError_SkipsWrappedHomeConcurrencyBusy(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 30*time.Second, 0)
+	if _, errRegister := m.Register(context.Background(), &Auth{ID: "retry-auth", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	_, _, maxWait := m.retrySettings()
+	errBusy := fmt.Errorf("outer retry: %w", NewHomeConcurrencyBusyError("busy", 20*time.Second))
+	wait, shouldRetry := m.shouldRetryAfterError(errBusy, 0, []string{"codex"}, "gpt", maxWait)
+	if shouldRetry || wait != 0 {
+		t.Fatalf("wrapped Home busy retry = (%v, %t), want (0, false)", wait, shouldRetry)
+	}
+}
+
 func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(3, 30*time.Second, 0)
@@ -1162,6 +1177,10 @@ func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(
 		status:  http.StatusRequestTimeout,
 		message: "stream error: stream disconnected before completion: stream closed before response.completed",
 	}
+	messageTooBigErr := &requestScopedStatusError{
+		status:  http.StatusRequestEntityTooLarge,
+		message: `{"error":{"message":"upstream websocket message too big","type":"invalid_request_error","code":"message_too_big"}}`,
+	}
 	invalidRequestErr := &Error{
 		HTTPStatus: http.StatusBadRequest,
 		Message:    `{"error":{"type":"invalid_request_error","code":"invalid_value","message":"Invalid input."}}`,
@@ -1172,12 +1191,15 @@ func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(
 	}
 	tests := []struct {
 		name       string
+		provider   string
 		stream     bool
 		err        error
 		wantStatus int
 	}{
 		{name: "non-streaming incomplete", err: incompleteErr, wantStatus: http.StatusRequestTimeout},
 		{name: "streaming incomplete", stream: true, err: incompleteErr, wantStatus: http.StatusRequestTimeout},
+		{name: "streaming codex websocket message too big", provider: "codex", stream: true, err: messageTooBigErr, wantStatus: http.StatusRequestEntityTooLarge},
+		{name: "streaming xai websocket message too big", provider: "xai", stream: true, err: messageTooBigErr, wantStatus: http.StatusRequestEntityTooLarge},
 		{name: "non-streaming invalid request", err: invalidRequestErr, wantStatus: http.StatusBadRequest},
 		{name: "streaming invalid request", stream: true, err: invalidRequestErr, wantStatus: http.StatusBadRequest},
 		{name: "non-streaming bad request", err: badRequestErr, wantStatus: http.StatusBadRequest},
@@ -1186,10 +1208,14 @@ func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			provider := tc.provider
+			if provider == "" {
+				provider = "codex"
+			}
 			m := NewManager(nil, nil, nil)
 			m.SetRetryConfig(2, 30*time.Second, 0)
 
-			executor := &authFallbackExecutor{id: "codex"}
+			executor := &authFallbackExecutor{id: provider}
 			if tc.stream {
 				executor.streamFirstErrors = map[string]error{"aa-bad-auth": tc.err}
 			} else {
@@ -1198,8 +1224,8 @@ func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(
 			m.RegisterExecutor(executor)
 
 			model := "gpt-5.5"
-			badAuth := &Auth{ID: "aa-bad-auth", Provider: "codex"}
-			goodAuth := &Auth{ID: "bb-good-auth", Provider: "codex"}
+			badAuth := &Auth{ID: "aa-bad-auth", Provider: provider}
+			goodAuth := &Auth{ID: "bb-good-auth", Provider: provider}
 
 			reg := registry.GetGlobalRegistry()
 			reg.RegisterClient(badAuth.ID, badAuth.Provider, []*registry.ModelInfo{{ID: model}})
@@ -1218,14 +1244,14 @@ func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(
 
 			var errExecute error
 			if tc.stream {
-				result, errStream := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+				result, errStream := m.ExecuteStream(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
 				if result != nil {
 					for range result.Chunks {
 					}
 				}
 				errExecute = errStream
 			} else {
-				_, errExecute = m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				_, errExecute = m.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
 			}
 			if errExecute == nil {
 				t.Fatal("expected request-scoped stream error")
