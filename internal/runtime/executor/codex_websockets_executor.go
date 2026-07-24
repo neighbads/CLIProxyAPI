@@ -508,7 +508,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errPromptCache
 	}
 	clientBody := body
-	_, errContext := validateClaudeBridgeContextWindow(baseModel, clientBody, opts)
+	_, errContext := validateClaudeBridgeContextWindow(configuredClaudeBridgeContextWindow(e.cfg), baseModel, clientBody, opts)
 	if errContext != nil {
 		return resp, errContext
 	}
@@ -814,7 +814,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, errPromptCache
 	}
 	clientBody := body
-	estimatedClaudeInputTokens, errContext := validateClaudeBridgeContextWindow(baseModel, clientBody, opts)
+	estimatedClaudeInputTokens, errContext := validateClaudeBridgeContextWindow(configuredClaudeBridgeContextWindow(e.cfg), baseModel, clientBody, opts)
 	if errContext != nil {
 		return nil, errContext
 	}

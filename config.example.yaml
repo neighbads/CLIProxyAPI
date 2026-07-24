@@ -213,6 +213,12 @@ codex:
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
 
+# Bridge Claude Messages requests routed to GPT/Codex models through the native Codex Responses API.
+claude-codex-responses-bridge:
+  enabled: true
+  # Proxy-side context window limit in tokens. Set to 0 to disable the artificial limit.
+  context-window: 0
+
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
 

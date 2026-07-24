@@ -16,8 +16,8 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-func shouldUseClaudeResponsesBridge(clientModel, upstreamModel string) bool {
-	if clientModel == "" || clientModel == upstreamModel {
+func shouldUseClaudeResponsesBridge(enabled bool, clientModel, upstreamModel string) bool {
+	if !enabled || clientModel == "" || clientModel == upstreamModel {
 		return false
 	}
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(upstreamModel)), "gpt-")

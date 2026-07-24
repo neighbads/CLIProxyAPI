@@ -254,13 +254,14 @@ func TestCodexExecutorCountTokensReturnsExactInputCount(t *testing.T) {
 }
 
 func TestValidateClaudeBridgeContextWindowRejectsOversizedInput(t *testing.T) {
+	const contextWindow = int64(200_000)
 	body := []byte(`{"model":"gpt-5.6-luna","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":` + string(mustJSONMarshalExecutorTest(t, strings.Repeat("x ", 200_500))) + `}]}]}`)
-	count, errContext := validateClaudeBridgeContextWindow("gpt-5.6-luna", body, cliproxyexecutor.Options{Alt: constant.ClaudeResponsesBridgeAlt})
+	count, errContext := validateClaudeBridgeContextWindow(contextWindow, "gpt-5.6-luna", body, cliproxyexecutor.Options{Alt: constant.ClaudeResponsesBridgeAlt})
 	if errContext == nil {
 		t.Fatalf("context count = %d, want context_too_large error", count)
 	}
-	if count <= claudeBridgeContextWindow {
-		t.Fatalf("context count = %d, want > %d", count, claudeBridgeContextWindow)
+	if count <= contextWindow {
+		t.Fatalf("context count = %d, want > %d", count, contextWindow)
 	}
 	statusCoder, ok := errContext.(interface{ StatusCode() int })
 	if !ok || statusCoder.StatusCode() != http.StatusBadRequest {
@@ -269,19 +270,32 @@ func TestValidateClaudeBridgeContextWindowRejectsOversizedInput(t *testing.T) {
 	if got := gjson.Get(errContext.Error(), "error.code").String(); got != "context_too_large" {
 		t.Fatalf("error code = %q, want context_too_large; error=%v", got, errContext)
 	}
-	if message := gjson.Get(errContext.Error(), "error.message").String(); !strings.Contains(message, "prompt is too long") {
-		t.Fatalf("error message = %q, want prompt is too long", message)
+	message := gjson.Get(errContext.Error(), "error.message").String()
+	if !strings.Contains(message, "prompt is too long") || !strings.Contains(message, "200000 maximum") {
+		t.Fatalf("error message = %q, want configured context window", message)
+	}
+}
+
+func TestValidateClaudeBridgeContextWindowZeroDisablesLimit(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-luna","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":` + string(mustJSONMarshalExecutorTest(t, strings.Repeat("x ", 200_500))) + `}]}]}`)
+	count, errContext := validateClaudeBridgeContextWindow(0, "gpt-5.6-luna", body, cliproxyexecutor.Options{Alt: constant.ClaudeResponsesBridgeAlt})
+	if errContext != nil {
+		t.Fatalf("zero context window rejected request: %v", errContext)
+	}
+	if count <= 0 {
+		t.Fatalf("context count = %d, want positive usage estimate", count)
 	}
 }
 
 func TestValidateClaudeBridgeContextWindowAllowsCompactedReplayAboveSyntheticLimit(t *testing.T) {
+	const contextWindow = int64(200_000)
 	body := []byte(`{"model":"gpt-5.6-luna","input":[{"type":"compaction","encrypted_content":"opaque-state"},{"type":"message","role":"user","content":[{"type":"input_text","text":` + string(mustJSONMarshalExecutorTest(t, strings.Repeat("x ", 200_500))) + `}]}]}`)
-	count, errContext := validateClaudeBridgeContextWindow("gpt-5.6-luna", body, cliproxyexecutor.Options{Alt: constant.ClaudeResponsesBridgeAlt})
+	count, errContext := validateClaudeBridgeContextWindow(contextWindow, "gpt-5.6-luna", body, cliproxyexecutor.Options{Alt: constant.ClaudeResponsesBridgeAlt})
 	if errContext != nil {
 		t.Fatalf("compacted replay rejected at synthetic limit: %v", errContext)
 	}
-	if count <= claudeBridgeContextWindow {
-		t.Fatalf("context count = %d, want > %d to exercise compacted replay exception", count, claudeBridgeContextWindow)
+	if count <= contextWindow {
+		t.Fatalf("context count = %d, want > %d to exercise compacted replay exception", count, contextWindow)
 	}
 }
 

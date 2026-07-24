@@ -43,10 +43,6 @@ const (
 	codexResponsesLiteMetadata   = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
 	claudeLiveUsageTickInterval  = 2 * time.Second
 	claudeThinkingTokenCountBeta = "thinking-token-count-2026-05-13"
-	// Claude clients treat unknown gateway model IDs as 200k-context models and
-	// enter their native compact-and-retry path after a context_too_large error.
-	// This compatibility boundary does not change the routed upstream model.
-	claudeBridgeContextWindow = int64(200_000)
 )
 
 func claudeThinkingTokenCountRequested(headers http.Header) bool {
@@ -58,7 +54,14 @@ func claudeThinkingTokenCountRequested(headers http.Header) bool {
 	return strings.EqualFold(strings.TrimSpace(headers.Get("X-App")), "cli") && strings.TrimSpace(headers.Get("X-Claude-Code-Session-Id")) != ""
 }
 
-func validateClaudeBridgeContextWindow(model string, body []byte, opts cliproxyexecutor.Options) (int64, error) {
+func configuredClaudeBridgeContextWindow(cfg *config.Config) int64 {
+	if cfg == nil {
+		return 0
+	}
+	return cfg.ClaudeCodexResponsesBridge.ContextWindow
+}
+
+func validateClaudeBridgeContextWindow(contextWindow int64, model string, body []byte, opts cliproxyexecutor.Options) (int64, error) {
 	if opts.Alt != constant.ClaudeResponsesBridgeAlt {
 		return 0, nil
 	}
@@ -66,11 +69,11 @@ func validateClaudeBridgeContextWindow(model string, body []byte, opts cliproxye
 	if errCount != nil {
 		return 0, errCount
 	}
-	if count <= claudeBridgeContextWindow || hasClaudeCompactionReplay(body) {
+	if contextWindow <= 0 || count <= contextWindow || hasClaudeCompactionReplay(body) {
 		return count, nil
 	}
 	errorBody := []byte(`{"error":{"message":"","type":"invalid_request_error","code":"context_too_large"}}`)
-	errorBody, _ = sjson.SetBytes(errorBody, "error.message", fmt.Sprintf("prompt is too long: %d tokens > %d maximum", count, claudeBridgeContextWindow))
+	errorBody, _ = sjson.SetBytes(errorBody, "error.message", fmt.Sprintf("prompt is too long: %d tokens > %d maximum", count, contextWindow))
 	return count, newCodexStatusErr(http.StatusBadRequest, errorBody)
 }
 
@@ -1221,7 +1224,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if errReplay != nil {
 		return resp, errReplay
 	}
-	if _, errContext := validateClaudeBridgeContextWindow(baseModel, body, opts); errContext != nil {
+	if _, errContext := validateClaudeBridgeContextWindow(configuredClaudeBridgeContextWindow(e.cfg), baseModel, body, opts); errContext != nil {
 		return resp, errContext
 	}
 	reporter.SetTranslatedReasoningEffort(body, to.String())
@@ -1504,7 +1507,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if errReplay != nil {
 		return nil, errReplay
 	}
-	estimatedClaudeInputTokens, errContext := validateClaudeBridgeContextWindow(baseModel, body, opts)
+	estimatedClaudeInputTokens, errContext := validateClaudeBridgeContextWindow(configuredClaudeBridgeContextWindow(e.cfg), baseModel, body, opts)
 	if errContext != nil {
 		return nil, errContext
 	}

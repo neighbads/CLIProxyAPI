@@ -86,7 +86,8 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
 	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
 	upstreamModel := gjson.GetBytes(rawJSON, "model").String()
-	if shouldUseClaudeResponsesBridge(clientModel, upstreamModel) {
+	bridgeEnabled := h.Cfg == nil || h.Cfg.ClaudeCodexResponsesBridge.IsEnabled()
+	if shouldUseClaudeResponsesBridge(bridgeEnabled, clientModel, upstreamModel) {
 		h.handleResponsesBridge(c, rawJSON, clientModel)
 		return
 	}

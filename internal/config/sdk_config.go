@@ -52,9 +52,28 @@ type SDKConfig struct {
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
 
+	// ClaudeCodexResponsesBridge configures the Claude Messages to Codex Responses bridge.
+	ClaudeCodexResponsesBridge ClaudeCodexResponsesBridgeConfig `yaml:"claude-codex-responses-bridge" json:"claude-codex-responses-bridge"`
+
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+}
+
+// ClaudeCodexResponsesBridgeConfig controls the Claude Messages to Codex Responses bridge.
+type ClaudeCodexResponsesBridgeConfig struct {
+	// Enabled controls whether decoded GPT model aliases use the Codex Responses bridge.
+	// Nil defaults to true.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+
+	// ContextWindow is the optional proxy-side context window limit in tokens.
+	// Values <= 0 disable the proxy-side limit while preserving token estimation.
+	ContextWindow int64 `yaml:"context-window" json:"context-window"`
+}
+
+// IsEnabled reports whether the Claude-to-Codex Responses bridge is enabled.
+func (c ClaudeCodexResponsesBridgeConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
 }
 
 // StreamingConfig holds server streaming behavior configuration.

@@ -77,6 +77,11 @@ func (e *responsesBridgeCaptureExecutor) capture(req coreexecutor.Request, opts 
 
 func newResponsesBridgeHandler(t *testing.T) (*ClaudeCodeAPIHandler, *responsesBridgeCaptureExecutor) {
 	t.Helper()
+	return newResponsesBridgeHandlerWithConfig(t, nil)
+}
+
+func newResponsesBridgeHandlerWithConfig(t *testing.T, cfg *sdkconfig.SDKConfig) (*ClaudeCodeAPIHandler, *responsesBridgeCaptureExecutor) {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 	executor := &responsesBridgeCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
@@ -94,7 +99,11 @@ func newResponsesBridgeHandler(t *testing.T) (*ClaudeCodeAPIHandler, *responsesB
 	t.Cleanup(func() {
 		registry.GetGlobalRegistry().UnregisterClient(oauth.ID)
 	})
-	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{PassthroughHeaders: true}, manager)
+	if cfg == nil {
+		cfg = &sdkconfig.SDKConfig{}
+	}
+	cfg.PassthroughHeaders = true
+	base := handlers.NewBaseAPIHandlers(cfg, manager)
 	return NewClaudeCodeAPIHandler(base), executor
 }
 
@@ -112,19 +121,21 @@ func serveClaudeMessages(t *testing.T, handler *ClaudeCodeAPIHandler, target, bo
 func TestShouldUseClaudeResponsesBridge(t *testing.T) {
 	tests := []struct {
 		name          string
+		enabled       bool
 		clientModel   string
 		upstreamModel string
 		wantResponses bool
 	}{
-		{name: "encoded GPT model", clientModel: responsesBridgeClientModel, upstreamModel: responsesBridgeUpstreamModel, wantResponses: true},
-		{name: "plain GPT model", clientModel: responsesBridgeUpstreamModel, upstreamModel: responsesBridgeUpstreamModel, wantResponses: false},
-		{name: "native Claude model", clientModel: "claude-sonnet-4-6", upstreamModel: "claude-sonnet-4-6", wantResponses: false},
-		{name: "encoded non-GPT model", clientModel: "claude-fable-5-dd-orp-5.2-inimeg", upstreamModel: "gemini-2.5-pro", wantResponses: false},
+		{name: "enabled encoded GPT model", enabled: true, clientModel: responsesBridgeClientModel, upstreamModel: responsesBridgeUpstreamModel, wantResponses: true},
+		{name: "disabled encoded GPT model", enabled: false, clientModel: responsesBridgeClientModel, upstreamModel: responsesBridgeUpstreamModel, wantResponses: false},
+		{name: "plain GPT model", enabled: true, clientModel: responsesBridgeUpstreamModel, upstreamModel: responsesBridgeUpstreamModel, wantResponses: false},
+		{name: "native Claude model", enabled: true, clientModel: "claude-sonnet-4-6", upstreamModel: "claude-sonnet-4-6", wantResponses: false},
+		{name: "encoded non-GPT model", enabled: true, clientModel: "claude-fable-5-dd-orp-5.2-inimeg", upstreamModel: "gemini-2.5-pro", wantResponses: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldUseClaudeResponsesBridge(tt.clientModel, tt.upstreamModel); got != tt.wantResponses {
-				t.Fatalf("shouldUseClaudeResponsesBridge(%q, %q) = %v, want %v", tt.clientModel, tt.upstreamModel, got, tt.wantResponses)
+			if got := shouldUseClaudeResponsesBridge(tt.enabled, tt.clientModel, tt.upstreamModel); got != tt.wantResponses {
+				t.Fatalf("shouldUseClaudeResponsesBridge(%v, %q, %q) = %v, want %v", tt.enabled, tt.clientModel, tt.upstreamModel, got, tt.wantResponses)
 			}
 		})
 	}
@@ -173,6 +184,22 @@ func TestIsClaudeCompactRequest(t *testing.T) {
 				t.Fatalf("isClaudeCompactRequest() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestClaudeMessagesResponsesBridgeDisabledUsesStandardHandler(t *testing.T) {
+	enabled := false
+	handler, executor := newResponsesBridgeHandlerWithConfig(t, &sdkconfig.SDKConfig{
+		ClaudeCodexResponsesBridge: sdkconfig.ClaudeCodexResponsesBridgeConfig{Enabled: &enabled},
+	})
+	body := `{"model":"claude-fable-5-dd-los-6.5-tpg","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}`
+	recorder := serveClaudeMessages(t, handler, "/v1/messages", body)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if executor.options.Alt == constant.ClaudeResponsesBridgeAlt {
+		t.Fatalf("disabled bridge used Alt %q", executor.options.Alt)
 	}
 }
 
