@@ -24,11 +24,19 @@ func TestCodexExecutorClaudeResponsesBridgeUsesOAuthToken(t *testing.T) {
 	var gotPath string
 	var gotAuthorization string
 	var gotAccountID string
+	var gotUserAgent string
+	var gotOriginator string
+	var gotVersion string
+	var gotSessionID string
 	var gotBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotAuthorization = r.Header.Get("Authorization")
 		gotAccountID = r.Header.Get("Chatgpt-Account-Id")
+		gotUserAgent = r.Header.Get("User-Agent")
+		gotOriginator = r.Header.Get("Originator")
+		gotVersion = r.Header.Get("Version")
+		gotSessionID = codexSessionHeaderValue(r.Header)
 		body, errRead := io.ReadAll(r.Body)
 		if errRead != nil {
 			t.Fatalf("read request body: %v", errRead)
@@ -46,7 +54,15 @@ func TestCodexExecutorClaudeResponsesBridgeUsesOAuthToken(t *testing.T) {
 	}
 	requestBody := []byte(`{"model":"gpt-5.6-sol","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}`)
 	opts := claudeResponsesBridgeOptions(requestBody, false)
-	opts.Headers = http.Header{"Authorization": []string{"Bearer local-proxy-token"}, "X-Api-Key": []string{"local-proxy-key"}}
+	opts.Headers = http.Header{
+		"Authorization":            []string{"Bearer local-proxy-token"},
+		"X-Api-Key":                []string{"local-proxy-key"},
+		"User-Agent":               []string{"claude-cli/2.1.211"},
+		"Originator":               []string{"claude-code"},
+		"Version":                  []string{"2.1.211"},
+		"Session_Id":               []string{"claude-session-alias"},
+		"X-Claude-Code-Session-Id": []string{"claude-session"},
+	}
 	response, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.6-sol",
 		Payload: requestBody,
@@ -64,6 +80,18 @@ func TestCodexExecutorClaudeResponsesBridgeUsesOAuthToken(t *testing.T) {
 	if gotAccountID != "oauth-account" {
 		t.Fatalf("Chatgpt-Account-Id = %q, want OAuth account", gotAccountID)
 	}
+	if gotUserAgent != codexUserAgent {
+		t.Fatalf("User-Agent = %q, want Codex fallback %q", gotUserAgent, codexUserAgent)
+	}
+	if gotOriginator != codexOriginator {
+		t.Fatalf("Originator = %q, want %q", gotOriginator, codexOriginator)
+	}
+	if gotVersion != "" {
+		t.Fatalf("Version = %q, want Claude version filtered", gotVersion)
+	}
+	if gotSessionID == "" || gotSessionID == "claude-session-alias" {
+		t.Fatalf("session ID = %q, want generated Codex session", gotSessionID)
+	}
 	if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-5.6-sol" {
 		t.Fatalf("upstream model = %q, want gpt-5.6-sol; body=%s", got, gotBody)
 	}
@@ -80,9 +108,17 @@ func TestCodexExecutorClaudeResponsesBridgeUsesOAuthToken(t *testing.T) {
 
 func TestCodexExecutorClaudeResponsesBridgeStreamUsesOAuthToken(t *testing.T) {
 	var gotAuthorization string
+	var gotUserAgent string
+	var gotOriginator string
+	var gotVersion string
+	var gotSessionID string
 	var gotBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuthorization = r.Header.Get("Authorization")
+		gotUserAgent = r.Header.Get("User-Agent")
+		gotOriginator = r.Header.Get("Originator")
+		gotVersion = r.Header.Get("Version")
+		gotSessionID = codexSessionHeaderValue(r.Header)
 		body, errRead := io.ReadAll(r.Body)
 		if errRead != nil {
 			t.Fatalf("read request body: %v", errRead)
@@ -104,7 +140,15 @@ func TestCodexExecutorClaudeResponsesBridgeStreamUsesOAuthToken(t *testing.T) {
 	}
 	requestBody := []byte(`{"model":"gpt-5.6-sol","stream":true,"max_tokens":128,"messages":[{"role":"user","content":"hello"}]}`)
 	opts := claudeResponsesBridgeOptions(requestBody, true)
-	opts.Headers = http.Header{"X-Api-Key": []string{"local-proxy-key"}, "Anthropic-Beta": []string{"thinking-token-count-2026-05-13"}}
+	opts.Headers = http.Header{
+		"X-Api-Key":                []string{"local-proxy-key"},
+		"Anthropic-Beta":           []string{"thinking-token-count-2026-05-13"},
+		"User-Agent":               []string{"claude-cli/2.1.211"},
+		"Originator":               []string{"claude-code"},
+		"Version":                  []string{"2.1.211"},
+		"Session-Id":               []string{"claude-session-alias"},
+		"X-Claude-Code-Session-Id": []string{"claude-session"},
+	}
 	stream, errExecute := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.6-sol",
 		Payload: requestBody,
@@ -121,6 +165,15 @@ func TestCodexExecutorClaudeResponsesBridgeStreamUsesOAuthToken(t *testing.T) {
 	}
 	if gotAuthorization != "Bearer oauth-token" {
 		t.Fatalf("Authorization = %q, want OAuth token", gotAuthorization)
+	}
+	if gotUserAgent != codexUserAgent || gotOriginator != codexOriginator {
+		t.Fatalf("Codex fingerprint = (%q, %q), want (%q, %q)", gotUserAgent, gotOriginator, codexUserAgent, codexOriginator)
+	}
+	if gotVersion != "" {
+		t.Fatalf("Version = %q, want Claude version filtered", gotVersion)
+	}
+	if gotSessionID == "" || gotSessionID == "claude-session-alias" {
+		t.Fatalf("session ID = %q, want generated Codex session", gotSessionID)
 	}
 	if gjson.GetBytes(gotBody, "context_management").Exists() {
 		t.Fatalf("normal stream bridge injected context_management: %s", gotBody)
@@ -407,10 +460,18 @@ func assertClaudeBridgeUsageStream(t *testing.T, output string) {
 func TestCodexExecutorClaudeResponsesCompactBridgeUsesOAuthToken(t *testing.T) {
 	var gotPath string
 	var gotAuthorization string
+	var gotUserAgent string
+	var gotOriginator string
+	var gotVersion string
+	var gotSessionID string
 	var gotBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotAuthorization = r.Header.Get("Authorization")
+		gotUserAgent = r.Header.Get("User-Agent")
+		gotOriginator = r.Header.Get("Originator")
+		gotVersion = r.Header.Get("Version")
+		gotSessionID = codexSessionHeaderValue(r.Header)
 		body, _ := io.ReadAll(r.Body)
 		gotBody = body
 		w.Header().Set("Content-Type", "application/json")
@@ -432,7 +493,14 @@ func TestCodexExecutorClaudeResponsesCompactBridgeUsesOAuthToken(t *testing.T) {
 		SourceFormat:    sdktranslator.FormatClaude,
 		ResponseFormat:  sdktranslator.FormatOpenAIResponse,
 		OriginalRequest: requestBody,
-		Headers:         http.Header{"Authorization": []string{"Bearer local-proxy-token"}},
+		Headers: http.Header{
+			"Authorization":            []string{"Bearer local-proxy-token"},
+			"User-Agent":               []string{"claude-cli/2.1.211"},
+			"Originator":               []string{"claude-code"},
+			"Version":                  []string{"2.1.211"},
+			"session_id":               []string{"claude-session-alias"},
+			"X-Claude-Code-Session-Id": []string{"claude-session"},
+		},
 	})
 	if errExecute != nil {
 		t.Fatalf("Execute compact error: %v", errExecute)
@@ -442,6 +510,15 @@ func TestCodexExecutorClaudeResponsesCompactBridgeUsesOAuthToken(t *testing.T) {
 	}
 	if gotAuthorization != "Bearer oauth-token" {
 		t.Fatalf("Authorization = %q, want OAuth token", gotAuthorization)
+	}
+	if gotUserAgent != codexUserAgent || gotOriginator != codexOriginator {
+		t.Fatalf("Codex fingerprint = (%q, %q), want (%q, %q)", gotUserAgent, gotOriginator, codexUserAgent, codexOriginator)
+	}
+	if gotVersion != "" {
+		t.Fatalf("Version = %q, want Claude version filtered", gotVersion)
+	}
+	if gotSessionID == "" || gotSessionID == "claude-session-alias" {
+		t.Fatalf("session ID = %q, want generated Codex session", gotSessionID)
 	}
 	if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-5.6-sol" {
 		t.Fatalf("compact upstream model = %q; body=%s", got, gotBody)

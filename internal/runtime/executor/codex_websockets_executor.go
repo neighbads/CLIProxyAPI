@@ -515,7 +515,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
-	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	wsHeaders = applyCodexWebsocketHeadersFromSources(wsHeaders, auth, apiKey, e.cfg, codexHeaderSource(ctx, opts))
 	applyModelHeaderOverrides(wsHeaders, baseModel)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 
@@ -821,7 +821,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
-	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	wsHeaders = applyCodexWebsocketHeadersFromSources(wsHeaders, auth, apiKey, e.cfg, codexHeaderSource(ctx, opts))
 	applyModelHeaderOverrides(wsHeaders, baseModel)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 
@@ -1546,6 +1546,14 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 }
 
 func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) http.Header {
+	var sourceHeaders http.Header
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		sourceHeaders = ginCtx.Request.Header.Clone()
+	}
+	return applyCodexWebsocketHeadersFromSources(headers, auth, token, cfg, sourceHeaders)
+}
+
+func applyCodexWebsocketHeadersFromSources(headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, sourceHeaders http.Header) http.Header {
 	if headers == nil {
 		headers = http.Header{}
 	}
@@ -1553,28 +1561,23 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		headers.Set("Authorization", "Bearer "+token)
 	}
 
-	var ginHeaders http.Header
-	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		ginHeaders = ginCtx.Request.Header.Clone()
-	}
-
 	isAPIKey := codexAuthUsesAPIKey(auth)
 	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
-	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
-	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
-	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
-	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
-	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
-	misc.EnsureHeader(headers, ginHeaders, "Version", "")
+	ensureHeaderWithPriority(headers, sourceHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
+	misc.EnsureHeader(headers, sourceHeaders, "x-codex-turn-state", "")
+	misc.EnsureHeader(headers, sourceHeaders, "x-codex-turn-metadata", "")
+	misc.EnsureHeader(headers, sourceHeaders, "x-client-request-id", "")
+	misc.EnsureHeader(headers, sourceHeaders, "x-responsesapi-include-timing-metrics", "")
+	misc.EnsureHeader(headers, sourceHeaders, "Version", "")
 	if isAPIKey {
-		ensureHeaderWithPriority(headers, ginHeaders, "User-Agent", "", "")
+		ensureHeaderWithPriority(headers, sourceHeaders, "User-Agent", "", "")
 	} else {
-		ensureHeaderWithConfigPrecedence(headers, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+		ensureHeaderWithConfigPrecedence(headers, sourceHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 	}
 
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
-	if betaHeader == "" && ginHeaders != nil {
-		betaHeader = strings.TrimSpace(ginHeaders.Get("OpenAI-Beta"))
+	if betaHeader == "" && sourceHeaders != nil {
+		betaHeader = strings.TrimSpace(sourceHeaders.Get("OpenAI-Beta"))
 	}
 	if betaHeader == "" || !strings.Contains(betaHeader, "responses_websockets=") {
 		betaHeader = codexResponsesWebsocketBetaHeaderValue
@@ -1584,8 +1587,8 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
 		sessionFallback = uuid.NewString()
 	}
-	ensureCodexWebsocketSessionHeader(headers, ginHeaders, sessionFallback)
-	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
+	ensureCodexWebsocketSessionHeader(headers, sourceHeaders, sessionFallback)
+	if originator := strings.TrimSpace(sourceHeaders.Get("Originator")); originator != "" {
 		headers.Set("Originator", originator)
 	} else if !isAPIKey {
 		headers.Set("Originator", codexOriginator)

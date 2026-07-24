@@ -1235,7 +1235,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	applyCodexHeadersFromSources(httpReq, auth, apiKey, true, e.cfg, codexHeaderSource(ctx, opts))
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -1397,7 +1397,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+	applyCodexHeadersFromSources(httpReq, auth, apiKey, false, e.cfg, codexHeaderSource(ctx, opts))
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -1519,7 +1519,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	applyCodexHeadersFromSources(httpReq, auth, apiKey, true, e.cfg, codexHeaderSource(ctx, opts))
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -2037,7 +2037,7 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 	}
 
 	state := codexIdentityConfuseState{enabled: true, authID: strings.TrimSpace(auth.ID)}
-	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(userPayload, "prompt_cache_key").String()); promptCacheKey != "" {
+	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String()); promptCacheKey != "" {
 		state.originalPromptCacheKey = promptCacheKey
 		state.promptCacheKey = codexIdentityConfuseUUID(auth.ID, "prompt-cache", promptCacheKey)
 		rawJSON = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", state.promptCacheKey)
@@ -2151,6 +2151,30 @@ func codexIdentityConfuseEnabled(cfg *config.Config) bool {
 func codexIdentityConfuseUUID(authID string, kind string, value string) string {
 	name := strings.Join([]string{"cli-proxy-api", "codex", "identity-confuse", kind, strings.TrimSpace(authID), strings.TrimSpace(value)}, ":")
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
+}
+
+func codexHeaderSource(ctx context.Context, opts cliproxyexecutor.Options) http.Header {
+	if opts.Alt != constant.ClaudeResponsesBridgeAlt && opts.Alt != constant.ClaudeResponsesCompactBridgeAlt {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			return ginCtx.Request.Header
+		}
+		return nil
+	}
+
+	headers := opts.Headers.Clone()
+	if headers == nil {
+		headers = http.Header{}
+	}
+	deleteHeaderCaseInsensitive(headers, "User-Agent")
+	headers.Set("User-Agent", codexUserAgent)
+	deleteHeaderCaseInsensitive(headers, "Originator")
+	deleteHeaderCaseInsensitive(headers, "Version")
+	for key := range headers {
+		if codexSessionHeaderKey(key) {
+			delete(headers, key)
+		}
+	}
+	return headers
 }
 
 func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {

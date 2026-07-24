@@ -10,12 +10,139 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestCodexHeaderSourceFiltersClaudeBridgeFingerprint(t *testing.T) {
+	for _, alt := range []string{constant.ClaudeResponsesBridgeAlt, constant.ClaudeResponsesCompactBridgeAlt} {
+		t.Run(alt, func(t *testing.T) {
+			headers := http.Header{
+				"User-Agent":               []string{"claude-cli/2.1.211"},
+				"Originator":               []string{"claude-code"},
+				"Version":                  []string{"2.1.211"},
+				"Session_Id":               []string{"claude-session-alias"},
+				"Anthropic-Beta":           []string{"thinking-token-count-2026-05-13"},
+				"X-Claude-Code-Session-Id": []string{"claude-session"},
+				"X-Claude-Code-Agent-Id":   []string{"agent-1"},
+			}
+			source := codexHeaderSource(context.Background(), cliproxyexecutor.Options{Alt: alt, Headers: headers})
+
+			if got := source.Get("User-Agent"); got != codexUserAgent {
+				t.Fatalf("User-Agent = %q, want Codex fallback %q", got, codexUserAgent)
+			}
+			for _, key := range []string{"Originator", "Version"} {
+				if got := source.Get(key); got != "" {
+					t.Fatalf("%s = %q, want filtered", key, got)
+				}
+			}
+			for key := range source {
+				if codexSessionHeaderKey(key) {
+					t.Fatalf("session header %q was not filtered", key)
+				}
+			}
+			if got := source.Get("Anthropic-Beta"); got == "" {
+				t.Fatal("Anthropic-Beta was removed from bridge source")
+			}
+			if got := source.Get("X-Claude-Code-Session-Id"); got != "claude-session" {
+				t.Fatalf("X-Claude-Code-Session-Id = %q, want preserved", got)
+			}
+			if got := headers.Get("User-Agent"); got != "claude-cli/2.1.211" {
+				t.Fatalf("original headers were mutated: User-Agent = %q", got)
+			}
+			if got := headers["Session_Id"]; len(got) != 1 || got[0] != "claude-session-alias" {
+				t.Fatalf("original headers were mutated: Session_Id = %#v", got)
+			}
+		})
+	}
+}
+
+func TestCodexHeaderSourceKeepsNonBridgeGinFingerprint(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request.Header.Set("User-Agent", "codex-client/1.0")
+	ginCtx.Request.Header.Set("Originator", "codex-client")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	source := codexHeaderSource(ctx, cliproxyexecutor.Options{Headers: http.Header{"User-Agent": []string{"ignored-options"}}})
+	if got := source.Get("User-Agent"); got != "codex-client/1.0" {
+		t.Fatalf("User-Agent = %q, want Gin source", got)
+	}
+	if got := source.Get("Originator"); got != "codex-client" {
+		t.Fatalf("Originator = %q, want Gin source", got)
+	}
+}
+
+func TestApplyCodexIdentityConfuseBodyUsesEffectivePromptCacheKey(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	userPayload := []byte(`{"prompt_cache_key":"stale-client-key","client_metadata":{"x-codex-installation-id":"install-1"}}`)
+	rawJSON := []byte(`{"prompt_cache_key":"effective-generated-key","client_metadata":{"x-codex-installation-id":"synthetic-install"}}`)
+
+	bodyA, stateA := applyCodexIdentityConfuseBody(cfg, &cliproxyauth.Auth{ID: "auth-a"}, userPayload, rawJSON)
+	expectedA := codexIdentityConfuseUUID("auth-a", "prompt-cache", "effective-generated-key")
+	if stateA.originalPromptCacheKey != "effective-generated-key" || stateA.promptCacheKey != expectedA {
+		t.Fatalf("identity state = %#v, want effective prompt cache key mapped to %q", stateA, expectedA)
+	}
+	if got := gjson.GetBytes(bodyA, "prompt_cache_key").String(); got != expectedA {
+		t.Fatalf("prompt_cache_key = %q, want %q", got, expectedA)
+	}
+	expectedInstallation := codexIdentityConfuseUUID("auth-a", "installation", "install-1")
+	if got := gjson.GetBytes(bodyA, "client_metadata.x-codex-installation-id").String(); got != expectedInstallation {
+		t.Fatalf("installation ID = %q, want user payload mapping %q", got, expectedInstallation)
+	}
+
+	_, stateB := applyCodexIdentityConfuseBody(cfg, &cliproxyauth.Auth{ID: "auth-b"}, userPayload, rawJSON)
+	if stateB.promptCacheKey == stateA.promptCacheKey {
+		t.Fatalf("different auth IDs produced the same prompt cache key %q", stateB.promptCacheKey)
+	}
+}
+
+func TestCodexExecutorCacheHelper_IdentityConfuseMapsGeneratedClaudePromptKey(t *testing.T) {
+	executor := &CodexExecutor{cfg: &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}}
+	auth := &cliproxyauth.Auth{ID: "auth-claude", Provider: constant.Codex}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`),
+	}
+	headers := http.Header{"X-Claude-Code-Session-Id": []string{"claude-session"}}
+	httpReq, body, state, errCache := executor.cacheHelper(
+		context.Background(),
+		sdktranslator.FormatClaude,
+		"https://example.com/responses",
+		auth,
+		req,
+		req.Payload,
+		[]byte(`{"model":"gpt-5.6-sol","input":[]}`),
+		headers,
+	)
+	if errCache != nil {
+		t.Fatalf("cacheHelper() error = %v", errCache)
+	}
+	if state.originalPromptCacheKey == "" {
+		t.Fatal("generated Claude prompt cache key was not captured")
+	}
+	expected := codexIdentityConfuseUUID(auth.ID, "prompt-cache", state.originalPromptCacheKey)
+	if state.promptCacheKey != expected {
+		t.Fatalf("mapped prompt cache key = %q, want %q", state.promptCacheKey, expected)
+	}
+	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != expected {
+		t.Fatalf("body prompt_cache_key = %q, want %q", got, expected)
+	}
+	if got := codexSessionHeaderValue(httpReq.Header); got != expected {
+		t.Fatalf("session header = %q, want %q", got, expected)
+	}
+}
 
 func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFromAPIKey(t *testing.T) {
 	recorder := httptest.NewRecorder()

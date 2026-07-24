@@ -20,13 +20,13 @@ import (
 
 func TestCodexAutoExecutorClaudeResponsesBridgeStreamsOverWebsocket(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	capturedAuthorization := make(chan string, 1)
+	capturedHeaders := make(chan http.Header, 1)
 	capturedPayload := make(chan []byte, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/responses" {
 			t.Errorf("request path = %q, want /responses", r.URL.Path)
 		}
-		capturedAuthorization <- r.Header.Get("Authorization")
+		capturedHeaders <- r.Header.Clone()
 		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
 		if errUpgrade != nil {
 			t.Errorf("upgrade websocket: %v", errUpgrade)
@@ -58,7 +58,15 @@ func TestCodexAutoExecutorClaudeResponsesBridgeStreamsOverWebsocket(t *testing.T
 	}
 	requestBody := []byte(`{"model":"gpt-5.6-sol","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`)
 	opts := claudeResponsesBridgeOptions(requestBody, true)
-	opts.Headers = http.Header{"Authorization": []string{"Bearer local-proxy-token"}, "Anthropic-Beta": []string{"thinking-token-count-2026-05-13"}}
+	opts.Headers = http.Header{
+		"Authorization":            []string{"Bearer local-proxy-token"},
+		"Anthropic-Beta":           []string{"thinking-token-count-2026-05-13"},
+		"User-Agent":               []string{"claude-cli/2.1.211"},
+		"Originator":               []string{"claude-code"},
+		"Version":                  []string{"2.1.211"},
+		"session_id":               []string{"claude-session-alias"},
+		"X-Claude-Code-Session-Id": []string{"claude-session"},
+	}
 	stream, errExecute := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.6-sol",
 		Payload: requestBody,
@@ -75,12 +83,24 @@ func TestCodexAutoExecutorClaudeResponsesBridgeStreamsOverWebsocket(t *testing.T
 	}
 
 	select {
-	case authorization := <-capturedAuthorization:
-		if authorization != "Bearer oauth-token" {
+	case headers := <-capturedHeaders:
+		if authorization := headers.Get("Authorization"); authorization != "Bearer oauth-token" {
 			t.Fatalf("Authorization = %q, want OAuth token", authorization)
 		}
+		if userAgent := headers.Get("User-Agent"); userAgent != codexUserAgent {
+			t.Fatalf("User-Agent = %q, want Codex fallback %q", userAgent, codexUserAgent)
+		}
+		if originator := headers.Get("Originator"); originator != codexOriginator {
+			t.Fatalf("Originator = %q, want %q", originator, codexOriginator)
+		}
+		if version := headers.Get("Version"); version != "" {
+			t.Fatalf("Version = %q, want Claude version filtered", version)
+		}
+		if sessionID := codexSessionHeaderValue(headers); sessionID == "" || sessionID == "claude-session-alias" {
+			t.Fatalf("session ID = %q, want generated Codex session", sessionID)
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for websocket authorization")
+		t.Fatal("timed out waiting for websocket headers")
 	}
 	select {
 	case payload := <-capturedPayload:
@@ -94,6 +114,25 @@ func TestCodexAutoExecutorClaudeResponsesBridgeStreamsOverWebsocket(t *testing.T
 		t.Fatal("timed out waiting for websocket payload")
 	}
 	assertClaudeBridgeUsageStream(t, output.String())
+}
+
+func TestApplyCodexWebsocketHeadersClaudeBridgeAPIKeyUsesCodexUserAgent(t *testing.T) {
+	opts := cliproxyexecutor.Options{
+		Alt: constant.ClaudeResponsesBridgeAlt,
+		Headers: http.Header{
+			"User-Agent": []string{"claude-cli/2.1.211"},
+			"Originator": []string{"claude-code"},
+		},
+	}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "upstream-key"}}
+	headers := applyCodexWebsocketHeadersFromSources(nil, auth, "upstream-key", nil, codexHeaderSource(context.Background(), opts))
+
+	if got := headers.Get("User-Agent"); got != codexUserAgent {
+		t.Fatalf("User-Agent = %q, want Codex fallback %q", got, codexUserAgent)
+	}
+	if got := headers.Get("Originator"); got != "" {
+		t.Fatalf("Originator = %q, want API-key policy to leave it empty", got)
+	}
 }
 
 func TestReadCodexWebsocketMessageOrTickReturnsUsageTick(t *testing.T) {
