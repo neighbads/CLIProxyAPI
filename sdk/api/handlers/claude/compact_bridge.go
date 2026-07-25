@@ -11,8 +11,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
@@ -350,6 +352,7 @@ func (h *ClaudeCodeAPIHandler) handleCompactResponsesBridge(c *gin.Context, rawJ
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	compactLog := log.WithField("request_id", logging.GetRequestID(cliCtx))
 	if replay != nil {
 		cliCtx = handlers.WithPinnedAuthID(cliCtx, replay.AuthID)
 	}
@@ -362,6 +365,7 @@ func (h *ClaudeCodeAPIHandler) handleCompactResponsesBridge(c *gin.Context, rawJ
 	if !clientWantsStream {
 		stopKeepAlive = h.StartNonStreamingKeepAlive(c, cliCtx)
 	}
+	compactLog.Info("claude codex bridge: native compaction started")
 	response, errMsg := h.ExecuteProtocolWithAuthManager(cliCtx, handlers.ProtocolExecutionRequest{
 		EntryProtocol:  Claude,
 		ExitProtocol:   OpenaiResponse,
@@ -374,6 +378,7 @@ func (h *ClaudeCodeAPIHandler) handleCompactResponsesBridge(c *gin.Context, rawJ
 	})
 	stopKeepAlive()
 	if errMsg != nil {
+		compactLog.Error("claude codex bridge: native compaction upstream request failed")
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
@@ -383,12 +388,14 @@ func (h *ClaudeCodeAPIHandler) handleCompactResponsesBridge(c *gin.Context, rawJ
 	}
 	clientResponse, marker, errBuild := buildClaudeCompactResponse(response.Body, clientModel, modelName, selectedAuthID)
 	if errBuild != nil {
+		compactLog.Error("claude codex bridge: native compaction response build failed")
 		c.JSON(http.StatusBadGateway, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{Message: errBuild.Error(), Type: "api_error"},
 		})
 		cliCancel(errBuild)
 		return
 	}
+	compactLog.Info("claude codex bridge: native compaction succeeded")
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), response.Headers)
 	if !clientWantsStream {
 		c.Header("Content-Type", "application/json")
