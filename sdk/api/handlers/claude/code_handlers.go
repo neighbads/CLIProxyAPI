@@ -88,7 +88,11 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 	upstreamModel := gjson.GetBytes(rawJSON, "model").String()
 	bridgeEnabled := h.Cfg == nil || h.Cfg.ClaudeCodexResponsesBridge.IsEnabled()
 	if shouldUseClaudeResponsesBridge(bridgeEnabled, clientModel, upstreamModel) {
-		h.handleResponsesBridge(c, rawJSON, clientModel)
+		h.handleResponsesBridge(c, rawJSON, clientModel, isClaudeCompactRequest(rawJSON))
+		return
+	}
+	if useBridge, compactRequest := claudeResponsesPlainGPTBridgeMode(bridgeEnabled, clientModel, upstreamModel, rawJSON); useBridge {
+		h.handleResponsesBridge(c, rawJSON, clientModel, compactRequest)
 		return
 	}
 

@@ -141,6 +141,61 @@ func TestShouldUseClaudeResponsesBridge(t *testing.T) {
 	}
 }
 
+func TestClaudeResponsesPlainGPTBridgeMode(t *testing.T) {
+	compactBody := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any ToolS. Your task is to create a DETAILED\nSUMMARY of the conversation so far. REMINDER: Do NOT call any ToolS."}]}`)
+	ordinaryBody := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`)
+	marker := mustClaudeCompactionMarkerForTest(t)
+	replayBody := mustJSONMarshalForTest(t, map[string]any{
+		"model": responsesBridgeUpstreamModel,
+		"messages": []any{
+			map[string]any{"role": "assistant", "content": marker},
+			map[string]any{"role": "user", "content": "continue"},
+		},
+	})
+	quotedMarkerBody := mustJSONMarshalForTest(t, map[string]any{
+		"model": responsesBridgeUpstreamModel,
+		"messages": []any{
+			map[string]any{"role": "user", "content": `claudeCompactionCapsulePrefix = "` + marker + `"`},
+		},
+	})
+	tests := []struct {
+		name          string
+		enabled       bool
+		clientModel   string
+		upstreamModel string
+		body          []byte
+		wantBridge    bool
+		wantCompact   bool
+	}{
+		{name: "plain GPT compact request", enabled: true, clientModel: responsesBridgeUpstreamModel, upstreamModel: responsesBridgeUpstreamModel, body: compactBody, wantBridge: true, wantCompact: true},
+		{name: "plain GPT replay request", enabled: true, clientModel: responsesBridgeUpstreamModel, upstreamModel: responsesBridgeUpstreamModel, body: replayBody, wantBridge: true, wantCompact: false},
+		{name: "plain GPT quoted marker request", enabled: true, clientModel: responsesBridgeUpstreamModel, upstreamModel: responsesBridgeUpstreamModel, body: quotedMarkerBody, wantBridge: false, wantCompact: false},
+		{name: "plain GPT ordinary request", enabled: true, clientModel: responsesBridgeUpstreamModel, upstreamModel: responsesBridgeUpstreamModel, body: ordinaryBody, wantBridge: false, wantCompact: false},
+		{name: "disabled plain GPT compact request", enabled: false, clientModel: responsesBridgeUpstreamModel, upstreamModel: responsesBridgeUpstreamModel, body: compactBody, wantBridge: false, wantCompact: false},
+		{name: "disabled plain GPT replay request", enabled: false, clientModel: responsesBridgeUpstreamModel, upstreamModel: responsesBridgeUpstreamModel, body: replayBody, wantBridge: false, wantCompact: false},
+		{name: "encoded GPT compact request", enabled: true, clientModel: responsesBridgeClientModel, upstreamModel: responsesBridgeUpstreamModel, body: compactBody, wantBridge: false, wantCompact: false},
+		{name: "native Claude compact request", enabled: true, clientModel: "claude-sonnet-4-6", upstreamModel: "claude-sonnet-4-6", body: compactBody, wantBridge: false, wantCompact: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotBridge, gotCompact := claudeResponsesPlainGPTBridgeMode(tt.enabled, tt.clientModel, tt.upstreamModel, tt.body)
+			if gotBridge != tt.wantBridge || gotCompact != tt.wantCompact {
+				t.Fatalf("claudeResponsesPlainGPTBridgeMode(%v, %q, %q) = (%v, %v), want (%v, %v)", tt.enabled, tt.clientModel, tt.upstreamModel, gotBridge, gotCompact, tt.wantBridge, tt.wantCompact)
+			}
+		})
+	}
+}
+
+func BenchmarkClaudeResponsesPlainGPTBridgeModeOrdinary(b *testing.B) {
+	body := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"` + strings.Repeat("ordinary conversation content ", 4096) + `"}]}`)
+	b.ReportAllocs()
+	for b.Loop() {
+		if useBridge, _ := claudeResponsesPlainGPTBridgeMode(true, responsesBridgeUpstreamModel, responsesBridgeUpstreamModel, body); useBridge {
+			b.Fatal("ordinary plain GPT request used compact bridge")
+		}
+	}
+}
+
 func TestIsClaudeCompactRequest(t *testing.T) {
 	tests := []struct {
 		name string
@@ -274,6 +329,78 @@ func TestClaudeMessagesResponsesBridgeStreaming(t *testing.T) {
 	}
 	if _, pinned := gotOpts.Metadata[coreexecutor.PinnedAuthMetadataKey]; pinned {
 		t.Fatalf("stream bridge unexpectedly pinned an auth: %#v", gotOpts.Metadata)
+	}
+}
+
+func TestClaudeMessagesPlainGPTUsesStandardHandler(t *testing.T) {
+	handler, executor := newResponsesBridgeHandler(t)
+	body := `{"model":"gpt-5.6-sol","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}`
+	recorder := serveClaudeMessages(t, handler, "/v1/messages", body)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if executor.options.Alt == constant.ClaudeResponsesBridgeAlt || executor.options.Alt == constant.ClaudeResponsesCompactBridgeAlt {
+		t.Fatalf("ordinary plain GPT request used bridge Alt %q", executor.options.Alt)
+	}
+}
+
+func TestClaudeMessagesPlainGPTCompactUsesResponsesBridge(t *testing.T) {
+	handler, executor := newResponsesBridgeHandler(t)
+	body := `{"model":"gpt-5.6-sol","max_tokens":128,"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.\n- You already have all the context you need.\n- Tool calls will be REJECTED.\n- Your entire response must be plain text.\n\nYour task is to create a detailed summary of the conversation so far. Preserve the API details.\n\nREMINDER: Do NOT call any tools."}]}`
+	recorder := serveClaudeMessages(t, handler, "/v1/messages?beta=true", body)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("X-Upstream"); got != "compact" {
+		t.Fatalf("X-Upstream = %q, want compact", got)
+	}
+	if marker := gjson.Get(recorder.Body.String(), "content.0.text").String(); !strings.Contains(marker, claudeCompactionCapsulePrefix) {
+		t.Fatalf("plain GPT compact response has no capsule: %s", recorder.Body.String())
+	}
+	if executor.options.Alt != constant.ClaudeResponsesCompactBridgeAlt {
+		t.Fatalf("Alt = %q, want %q", executor.options.Alt, constant.ClaudeResponsesCompactBridgeAlt)
+	}
+	if executor.executeCalls != 1 || executor.streamCalls != 0 {
+		t.Fatalf("executor calls = execute:%d stream:%d, want 1/0", executor.executeCalls, executor.streamCalls)
+	}
+}
+
+func TestClaudeMessagesPlainGPTCompactReplayUsesResponsesBridge(t *testing.T) {
+	handler, executor := newResponsesBridgeHandler(t)
+	compactBody := `{"model":"gpt-5.6-sol","max_tokens":128,"messages":[{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far.\n\nREMINDER: Do NOT call any tools."}]}`
+	compactRecorder := serveClaudeMessages(t, handler, "/v1/messages", compactBody)
+	marker := gjson.Get(compactRecorder.Body.String(), "content.0.text").String()
+	if marker == "" {
+		t.Fatalf("plain GPT compact response has no marker: %s", compactRecorder.Body.String())
+	}
+
+	followupBody := mustJSONMarshalForTest(t, map[string]any{
+		"model":      responsesBridgeUpstreamModel,
+		"max_tokens": 128,
+		"messages": []any{
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": marker}}},
+			map[string]any{"role": "user", "content": "continue"},
+		},
+	})
+	followupRecorder := serveClaudeMessages(t, handler, "/v1/messages", string(followupBody))
+
+	if followupRecorder.Code != http.StatusOK {
+		t.Fatalf("follow-up status = %d; body=%s", followupRecorder.Code, followupRecorder.Body.String())
+	}
+	gotReq, gotOpts := executor.request, executor.options
+	if gotOpts.Alt != constant.ClaudeResponsesBridgeAlt {
+		t.Fatalf("follow-up Alt = %q, want %q", gotOpts.Alt, constant.ClaudeResponsesBridgeAlt)
+	}
+	if pinned := gotOpts.Metadata[coreexecutor.PinnedAuthMetadataKey]; pinned != "responses-bridge-auth" {
+		t.Fatalf("plain GPT compaction replay pinned auth = %#v, want responses-bridge-auth", pinned)
+	}
+	if got := gjson.GetBytes(gotReq.Payload, constant.ClaudeResponsesCompactionField+".output.1.type").String(); got != "compaction_summary" {
+		t.Fatalf("plain GPT replay compaction item type = %q; payload=%s", got, gotReq.Payload)
+	}
+	if got := gjson.GetBytes(gotReq.Payload, "messages.0.content").String(); got != "continue" {
+		t.Fatalf("plain GPT capsule message was not removed; payload=%s", gotReq.Payload)
 	}
 }
 

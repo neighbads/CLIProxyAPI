@@ -23,8 +23,21 @@ func shouldUseClaudeResponsesBridge(enabled bool, clientModel, upstreamModel str
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(upstreamModel)), "gpt-")
 }
 
-func (h *ClaudeCodeAPIHandler) handleResponsesBridge(c *gin.Context, rawJSON []byte, clientModel string) {
-	compactRequest := isClaudeCompactRequest(rawJSON)
+func claudeResponsesPlainGPTBridgeMode(enabled bool, clientModel, upstreamModel string, rawJSON []byte) (useBridge, compactRequest bool) {
+	if !enabled || clientModel == "" || clientModel != upstreamModel ||
+		!strings.HasPrefix(strings.ToLower(strings.TrimSpace(upstreamModel)), "gpt-") {
+		return false, false
+	}
+	if bytes.Contains(rawJSON, []byte("cpa-responses-compaction")) && hasClaudeCompactionCapsuleMarker(rawJSON) {
+		return true, false
+	}
+	if !mayBeClaudeCompactRequest(rawJSON) || !isClaudeCompactRequest(rawJSON) {
+		return false, false
+	}
+	return true, true
+}
+
+func (h *ClaudeCodeAPIHandler) handleResponsesBridge(c *gin.Context, rawJSON []byte, clientModel string, compactRequest bool) {
 	upstreamModel := gjson.GetBytes(rawJSON, "model").String()
 	preparedJSON, replay, errPrepare := prepareClaudeCompactionReplay(rawJSON, upstreamModel)
 	if errPrepare != nil {

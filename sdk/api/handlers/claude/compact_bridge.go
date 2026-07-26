@@ -43,16 +43,106 @@ type responsesCompactionResource struct {
 	} `json:"usage"`
 }
 
+func mayBeClaudeCompactRequest(rawJSON []byte) bool {
+	return containsASCIIFold(rawJSON, "detailed") &&
+		containsASCIIFold(rawJSON, "summary") &&
+		containsASCIIFold(rawJSON, "tools")
+}
+
+func containsASCIIFold(data []byte, keyword string) bool {
+	if keyword == "" {
+		return true
+	}
+	for i := 0; i+len(keyword) <= len(data); i++ {
+		if asciiLower(data[i]) != keyword[0] {
+			continue
+		}
+		matched := true
+		for j := 1; j < len(keyword); j++ {
+			if asciiLower(data[i+j]) != keyword[j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+func asciiLower(value byte) byte {
+	if value >= 'A' && value <= 'Z' {
+		return value + ('a' - 'A')
+	}
+	return value
+}
+
+func hasClaudeCompactionCapsuleMarker(rawJSON []byte) bool {
+	messages := gjson.GetBytes(rawJSON, "messages")
+	if !messages.IsArray() {
+		return false
+	}
+	found := false
+	messages.ForEach(func(_, message gjson.Result) bool {
+		content := message.Get("content")
+		if content.Type == gjson.String {
+			found = containsDelimitedClaudeCompactionMarker(content.String())
+			return !found
+		}
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(_, part gjson.Result) bool {
+			if part.Get("type").String() != "text" {
+				return true
+			}
+			found = containsDelimitedClaudeCompactionMarker(part.Get("text").String())
+			return !found
+		})
+		return !found
+	})
+	return found
+}
+
+func containsDelimitedClaudeCompactionMarker(text string) bool {
+	searchFrom := 0
+	for searchFrom < len(text) {
+		relativeStart := strings.Index(text[searchFrom:], claudeCompactionCapsulePrefix)
+		if relativeStart < 0 {
+			return false
+		}
+		start := searchFrom + relativeStart
+		encodedStart := start + len(claudeCompactionCapsulePrefix)
+		relativeEnd := strings.Index(text[encodedStart:], claudeCompactionCapsuleSuffix)
+		if relativeEnd < 0 {
+			return false
+		}
+		markerEnd := encodedStart + relativeEnd + len(claudeCompactionCapsuleSuffix)
+		if isDelimitedClaudeCompactionMarker(text, start, markerEnd) {
+			return true
+		}
+		searchFrom = encodedStart
+	}
+	return false
+}
+
 func isClaudeCompactRequest(rawJSON []byte) bool {
 	messages := gjson.GetBytes(rawJSON, "messages")
 	if !messages.IsArray() {
 		return false
 	}
-	items := messages.Array()
-	if len(items) == 0 || !strings.EqualFold(strings.TrimSpace(items[len(items)-1].Get("role").String()), "user") {
+	var lastMessage gjson.Result
+	hasMessage := false
+	messages.ForEach(func(_, message gjson.Result) bool {
+		lastMessage = message
+		hasMessage = true
+		return true
+	})
+	if !hasMessage || !strings.EqualFold(strings.TrimSpace(lastMessage.Get("role").String()), "user") {
 		return false
 	}
-	text := normalizedClaudeCompactPrompt(claudeMessageText(items[len(items)-1].Get("content")))
+	text := normalizedClaudeCompactPrompt(claudeMessageText(lastMessage.Get("content")))
 	if !strings.Contains(text, "critical: respond with text only") || strings.Count(text, "do not call any tools") < 2 {
 		return false
 	}
