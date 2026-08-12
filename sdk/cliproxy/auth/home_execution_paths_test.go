@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 )
@@ -318,6 +319,39 @@ func TestHomeWebsocketSessionReusesRetainedSelection(t *testing.T) {
 	}
 	if got := dispatcher.calls.Load(); got != 1 {
 		t.Fatalf("Home RPOP calls = %d, want 1 for one retained session target", got)
+	}
+	if got := executor.calls.Load(); got != 2 {
+		t.Fatalf("executor calls = %d, want 2", got)
+	}
+}
+
+func TestHomeClaudeHTTPWebsocketSessionReusesRetainedSelection(t *testing.T) {
+	dispatcher := &retainingHomeExecutionDispatcher{}
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+	manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
+	executor := &retainingHomeExecutionExecutor{}
+	manager.RegisterExecutor(executor)
+
+	payload := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
+	headers := http.Header{}
+	headers.Set("X-Claude-Code-Session-Id", "session-1")
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatClaude,
+		OriginalRequest: payload,
+		Headers:         headers,
+		Metadata: map[string]any{
+			cliproxyexecutor.CallerScopeMetadataKey: "caller-1",
+			cliproxyexecutor.PinnedAuthMetadataKey:  "home-auth",
+		},
+	}
+	for range 2 {
+		if _, errExecute := manager.Execute(context.Background(), []string{"home-execution"}, cliproxyexecutor.Request{Model: "model-a", Payload: payload}, opts); errExecute != nil {
+			t.Fatalf("Execute() error = %v", errExecute)
+		}
+	}
+	if got := dispatcher.calls.Load(); got != 1 {
+		t.Fatalf("Home RPOP calls = %d, want 1 for one retained Claude HTTP session", got)
 	}
 	if got := executor.calls.Load(); got != 2 {
 		t.Fatalf("executor calls = %d, want 2", got)

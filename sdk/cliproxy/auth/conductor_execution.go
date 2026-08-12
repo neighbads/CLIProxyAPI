@@ -340,7 +340,7 @@ func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExec
 		Stream:         opts.Stream,
 		Headers:        cloneRequestHeaders(opts.Headers),
 		Body:           bytes.Clone(req.Payload),
-		Metadata:       opts.Metadata,
+		Metadata:       cloneSchedulerAnyMap(opts.Metadata),
 	})
 	opts.Headers = mergeRequestHeaders(opts.Headers, resp.Headers, resp.ClearHeaders)
 	if len(resp.Body) > 0 {
