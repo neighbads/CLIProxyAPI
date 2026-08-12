@@ -4,14 +4,18 @@ package executor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -31,11 +35,8 @@ func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	}
 }
 
-// CodexAutoExecutor routes Codex requests to the websocket transport only when:
-//  1. The downstream transport is websocket, and
-//  2. The selected auth enables websockets.
-//
-// For non-websocket downstream requests, it always uses the legacy HTTP implementation.
+// CodexAutoExecutor routes Codex requests to websocket transport when the selected auth
+// enables it and the request has either a websocket downstream or an isolated Claude Code session.
 type CodexAutoExecutor struct {
 	httpExec *CodexExecutor
 	wsExec   *CodexWebsocketsExecutor
@@ -68,8 +69,8 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
-		return e.wsExec.Execute(ctx, auth, req, opts)
+	if wsOpts, ok := codexWebsocketOptions(ctx, auth, req, opts); ok {
+		return e.wsExec.Execute(ctx, auth, req, wsOpts)
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 		return cliproxyexecutor.Response{}, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
@@ -81,8 +82,8 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
-		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
+	if wsOpts, ok := codexWebsocketOptions(ctx, auth, req, opts); ok {
+		return e.wsExec.ExecuteStream(ctx, auth, req, wsOpts)
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 		return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
@@ -116,6 +117,47 @@ func (e *CodexAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan erro
 		return nil
 	}
 	return e.wsExec.UpstreamDisconnectChan(sessionID)
+}
+
+func codexWebsocketOptions(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Options, bool) {
+	if !codexWebsocketsEnabled(auth) {
+		return opts, false
+	}
+	if cliproxyexecutor.DownstreamWebsocket(ctx) {
+		return opts, true
+	}
+	if opts.Alt == "responses/compact" || !strings.EqualFold(strings.TrimSpace(opts.SourceFormat.String()), "claude") {
+		return opts, false
+	}
+
+	payload := opts.OriginalRequest
+	if len(payload) == 0 {
+		payload = req.Payload
+	}
+	executionScope := metadataString(opts.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey)
+	if executionScope == "" {
+		executionScope = cliproxysession.ClaudeCodeExecutionScope(opts.Headers, payload)
+	}
+	if executionScope == "" {
+		sessionID := helps.ExtractClaudeCodeSessionID(ctx, payload, opts.Headers)
+		if sessionID == "" {
+			return opts, false
+		}
+		executionScope = cliproxysession.ClaudeCodeExecutionScopeForIDs(sessionID, helps.ExtractClaudeCodeAgentID(ctx, opts.Headers))
+	}
+	callerScope := metadataString(opts.Metadata, cliproxyexecutor.CallerScopeMetadataKey)
+	if callerScope == "" {
+		return opts, false
+	}
+
+	sum := sha256.Sum256([]byte(strings.Join([]string{"codex-http-ws:v1", callerScope, executionScope}, "\x00")))
+	metadata := make(map[string]any, len(opts.Metadata)+1)
+	for key, value := range opts.Metadata {
+		metadata[key] = value
+	}
+	metadata[codexPooledUpstreamSessionMetadataKey] = "codex-http-ws:" + hex.EncodeToString(sum[:])
+	opts.Metadata = metadata
+	return opts, true
 }
 
 func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
