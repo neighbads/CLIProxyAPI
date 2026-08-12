@@ -79,6 +79,23 @@ func HeaderValuesCaseInsensitive(headers http.Header, name string) []string {
 	return result
 }
 
+func extractClaudeCodeSessionIDFromPayload(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	userID := gjson.GetBytes(payload, "metadata.user_id").String()
+	if userID == "" {
+		return ""
+	}
+	if matches := claudeCodeSessionSuffixPattern.FindStringSubmatch(userID); len(matches) >= 2 {
+		return matches[1]
+	}
+	if len(userID) > 0 && userID[0] == '{' {
+		return strings.TrimSpace(gjson.Get(userID, "session_id").String())
+	}
+	return ""
+}
+
 func headerValueCaseInsensitive(headers http.Header, name string) string {
 	if headers == nil {
 		return ""
@@ -95,23 +112,6 @@ func headerValueCaseInsensitive(headers http.Header, name string) string {
 				return value
 			}
 		}
-	}
-	return ""
-}
-
-func extractClaudeCodeSessionIDFromPayload(payload []byte) string {
-	if len(payload) == 0 {
-		return ""
-	}
-	userID := gjson.GetBytes(payload, "metadata.user_id").String()
-	if userID == "" {
-		return ""
-	}
-	if matches := claudeCodeSessionSuffixPattern.FindStringSubmatch(userID); len(matches) >= 2 {
-		return matches[1]
-	}
-	if len(userID) > 0 && userID[0] == '{' {
-		return strings.TrimSpace(gjson.Get(userID, "session_id").String())
 	}
 	return ""
 }
