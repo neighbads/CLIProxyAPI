@@ -69,6 +69,33 @@ func TestConvertCodexResponseToClaude_StreamThinkingIncludesSignature(t *testing
 	}
 }
 
+func TestConvertCodexResponseToClaude_StreamDoneOnlyReasoningSummary(t *testing.T) {
+	digest := digestCodexThinkingStream(t, [][]byte{
+		[]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_pre\"}}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"Checking the repository\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_final\"}}"),
+	})
+
+	if digest.Thinking != "Checking the repository" {
+		t.Fatalf("done-only reasoning summary was dropped: thinking = %q, want %q", digest.Thinking, "Checking the repository")
+	}
+}
+
+func TestConvertCodexResponseToClaude_StreamReasoningSummaryDoneDoesNotDuplicateDeltas(t *testing.T) {
+	digest := digestCodexThinkingStream(t, [][]byte{
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checking \"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"the repository\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"Checking the repository\"}"),
+	})
+
+	if digest.Thinking != "Checking the repository" {
+		t.Fatalf("thinking text = %q, want %q", digest.Thinking, "Checking the repository")
+	}
+}
+
 func TestConvertCodexResponseToClaude_StreamCyberPolicyError(t *testing.T) {
 	ctx := context.Background()
 	var param any
