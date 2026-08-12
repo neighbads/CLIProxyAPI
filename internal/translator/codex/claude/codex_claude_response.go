@@ -27,21 +27,22 @@ const codexThinkingSummaryPartSeparator = "\n\n"
 
 // ConvertCodexResponseToClaudeParams holds parameters for response conversion.
 type ConvertCodexResponseToClaudeParams struct {
-	HasEmittedToolUse      bool
-	BlockIndex             int
-	HasTextDelta           bool
-	TextBlockOpen          bool
-	ThinkingBlockOpen      bool
-	ThinkingSignature      string
-	ThinkingSummarySeen    bool
-	WebSearchToolUseIDs    map[string]struct{}
-	WebSearchToolResultIDs map[string]struct{}
-	LastWebSearchToolUseID string
-	FunctionCalls          map[string]*codexFunctionCallStream
-	FunctionCallQueue      []*codexFunctionCallStream
-	ActiveFunctionCall     *codexFunctionCallStream
-	LastFunctionCall       *codexFunctionCallStream
-	DeferredStreamEvents   [][]byte
+	HasEmittedToolUse         bool
+	BlockIndex                int
+	HasTextDelta              bool
+	TextBlockOpen             bool
+	ThinkingBlockOpen         bool
+	ThinkingSignature         string
+	ThinkingSummarySeen       bool
+	ThinkingSummaryPartLength int
+	WebSearchToolUseIDs       map[string]struct{}
+	WebSearchToolResultIDs    map[string]struct{}
+	LastWebSearchToolUseID    string
+	FunctionCalls             map[string]*codexFunctionCallStream
+	FunctionCallQueue         []*codexFunctionCallStream
+	ActiveFunctionCall        *codexFunctionCallStream
+	LastFunctionCall          *codexFunctionCallStream
+	DeferredStreamEvents      [][]byte
 }
 
 type codexFunctionCallStream struct {
@@ -119,10 +120,23 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			output = append(output, startCodexThinkingBlock(params)...)
 		}
 		params.ThinkingSummarySeen = true
+		params.ThinkingSummaryPartLength = 0
 	case "response.reasoning_summary_text.delta":
 		output = append(output, stopCodexTextBlock(params)...)
 		output = append(output, startCodexThinkingBlock(params)...)
-		output = append(output, appendCodexThinkingDelta(params, rootResult.Get("delta").String())...)
+		delta := rootResult.Get("delta").String()
+		output = append(output, appendCodexThinkingDelta(params, delta)...)
+		params.ThinkingSummarySeen = true
+		params.ThinkingSummaryPartLength += len(delta)
+	case "response.reasoning_summary_text.done":
+		output = append(output, stopCodexTextBlock(params)...)
+		output = append(output, startCodexThinkingBlock(params)...)
+		doneText := rootResult.Get("text").String()
+		if params.ThinkingSummaryPartLength <= len(doneText) {
+			output = append(output, appendCodexThinkingDelta(params, doneText[params.ThinkingSummaryPartLength:])...)
+		}
+		params.ThinkingSummarySeen = true
+		params.ThinkingSummaryPartLength = len(doneText)
 	case "response.reasoning_summary_part.done":
 		// Intentionally does not close the thinking block: it stays open until
 		// output_item.done delivers the reasoning item's final encrypted_content.
@@ -189,6 +203,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			// leak its still-open block into this one.
 			output = append(output, finalizeCodexThinkingBlock(params)...)
 			params.ThinkingSummarySeen = false
+			params.ThinkingSummaryPartLength = 0
 			// Kept only as a fallback for streams whose output_item.done omits
 			// encrypted_content; it is a pre-content snapshot, never the final value.
 			params.ThinkingSignature = itemResult.Get("encrypted_content").String()
@@ -255,6 +270,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			}
 			params.ThinkingSignature = ""
 			params.ThinkingSummarySeen = false
+			params.ThinkingSummaryPartLength = 0
 		case "web_search_call":
 			output = appendCodexWebSearchToolResult(output, params, rootResult, itemResult)
 		}

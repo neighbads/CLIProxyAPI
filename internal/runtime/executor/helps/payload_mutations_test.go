@@ -92,6 +92,38 @@ func TestApplyPayloadConfigReusesCanonicalOverrides(t *testing.T) {
 	}
 }
 
+func TestApplyPayloadConfigWithRequestAppliesCodexClaudeOverrides(t *testing.T) {
+	cfg := &config.Config{Payload: config.PayloadConfig{
+		Override: []config.PayloadRule{{
+			Models: []config.PayloadModelRule{{
+				Name:         "gpt-5.6-sol",
+				Protocol:     "codex",
+				FromProtocol: "claude",
+			}},
+			Params: map[string]any{
+				"reasoning.summary": "concise",
+				"text.verbosity":    "medium",
+			},
+		}},
+	}}
+	input := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
+	original := bytes.Clone(input)
+	output := ApplyPayloadConfigWithRequest(cfg, "gpt-5.6-sol", "codex", "claude", "", input, nil, "gpt-5.6-sol", "", nil)
+
+	if !gjson.ValidBytes(output) {
+		t.Fatalf("payload override generated invalid JSON: %s", output)
+	}
+	if got := gjson.GetBytes(output, "reasoning.summary").String(); got != "concise" {
+		t.Fatalf("reasoning.summary = %q, want concise; payload=%s", got, output)
+	}
+	if got := gjson.GetBytes(output, "text.verbosity").String(); got != "medium" {
+		t.Fatalf("text.verbosity = %q, want medium; payload=%s", got, output)
+	}
+	if !bytes.Equal(input, original) {
+		t.Fatal("input payload was modified in place")
+	}
+}
+
 func TestApplyPayloadConfigWithRequestTrackedReportsContextManagementTouches(t *testing.T) {
 	const automatic = `{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`
 	modelRules := []config.PayloadModelRule{{Name: "claude-opus-5", Protocol: "claude"}}
@@ -278,5 +310,78 @@ func BenchmarkSetStringIfDifferentLargeCanonicalPayload(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		benchmarkPayloadMutationOutput = SetStringIfDifferent(input, "model", "gpt-test")
+	}
+}
+
+func BenchmarkApplyPayloadConfigWithRequestLargeMissingOverrides(b *testing.B) {
+	input := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"` + strings.Repeat("x", 8<<20) + `"}]}]}`)
+	if !gjson.ValidBytes(input) {
+		b.Fatal("benchmark generated invalid Codex JSON")
+	}
+
+	payloadConfig := func(params map[string]any) *config.Config {
+		return &config.Config{Payload: config.PayloadConfig{
+			Override: []config.PayloadRule{{
+				Models: []config.PayloadModelRule{{
+					Name:         "gpt-5.6-sol",
+					Protocol:     "codex",
+					FromProtocol: "claude",
+				}},
+				Params: params,
+			}},
+		}}
+	}
+
+	for _, test := range []struct {
+		name          string
+		cfg           *config.Config
+		wantSummary   string
+		wantVerbosity string
+	}{
+		{name: "no_rules", cfg: &config.Config{}},
+		{
+			name:        "summary_only",
+			cfg:         payloadConfig(map[string]any{"reasoning.summary": "concise"}),
+			wantSummary: "concise",
+		},
+		{
+			name: "summary_verbosity",
+			cfg: payloadConfig(map[string]any{
+				"reasoning.summary": "concise",
+				"text.verbosity":    "medium",
+			}),
+			wantSummary:   "concise",
+			wantVerbosity: "medium",
+		},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			output := ApplyPayloadConfigWithRequest(test.cfg, "gpt-5.6-sol", "codex", "claude", "", input, nil, "gpt-5.6-sol", "", nil)
+			if !gjson.ValidBytes(output) {
+				b.Fatal("payload override generated invalid JSON")
+			}
+			summary := gjson.GetBytes(output, "reasoning.summary")
+			if test.wantSummary == "" {
+				if summary.Exists() {
+					b.Fatalf("reasoning.summary unexpectedly exists: %s", summary.Raw)
+				}
+			} else if summary.String() != test.wantSummary {
+				b.Fatalf("reasoning.summary = %q, want %q", summary.String(), test.wantSummary)
+			}
+			verbosity := gjson.GetBytes(output, "text.verbosity")
+			if test.wantVerbosity == "" {
+				if verbosity.Exists() {
+					b.Fatalf("text.verbosity unexpectedly exists: %s", verbosity.Raw)
+				}
+			} else if verbosity.String() != test.wantVerbosity {
+				b.Fatalf("text.verbosity = %q, want %q", verbosity.String(), test.wantVerbosity)
+			}
+
+			b.ReportAllocs()
+			b.SetBytes(int64(len(input)))
+			b.ResetTimer()
+			for b.Loop() {
+				benchmarkPayloadMutationOutput = ApplyPayloadConfigWithRequest(test.cfg, "gpt-5.6-sol", "codex", "claude", "", input, nil, "gpt-5.6-sol", "", nil)
+			}
+		})
 	}
 }
