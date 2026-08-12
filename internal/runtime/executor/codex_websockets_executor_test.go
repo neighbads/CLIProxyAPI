@@ -58,6 +58,58 @@ func BenchmarkBuildCodexWebsocketRequestBodyLargePayload(b *testing.B) {
 	}
 }
 
+func TestReadCodexWebsocketMessageCancelsWithoutSession(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	ready := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		close(ready)
+		defer func() { _ = conn.Close() }()
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+	<-ready
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, errRead := readCodexWebsocketMessage(ctx, nil, conn, nil)
+		done <- errRead
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case errRead := <-done:
+		if !errors.Is(errRead, context.Canceled) {
+			t.Fatalf("read error = %v, want context.Canceled", errRead)
+		}
+	case <-time.After(200 * time.Millisecond):
+		_ = conn.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("websocket read remained blocked after closing the connection")
+		}
+		t.Fatal("non-session websocket read ignored context cancellation for more than 200ms")
+	}
+}
+
 func TestBuildCodexWebsocketRequestBodySanitizesOverlongInputItemIDs(t *testing.T) {
 	longReasoningItemID := "rs_" + strings.Repeat("a", 64)
 	longCallItemID := strings.Repeat("grok-call-item-", 6)
