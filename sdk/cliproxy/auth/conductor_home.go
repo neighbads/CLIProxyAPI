@@ -519,16 +519,23 @@ func homeExecutionSessionIDFromMetadata(meta map[string]any) string {
 	}
 }
 
+func homeWebsocketSessionID(ctx context.Context, opts cliproxyexecutor.Options) string {
+	if cliproxyexecutor.DownstreamWebsocket(ctx) {
+		return homeExecutionSessionIDFromMetadata(opts.Metadata)
+	}
+	return codexWebsocketAffinityKey(opts)
+}
+
 type homeSessionSelectionKey struct {
 	credentialID string
 	routeModel   string
 }
 
 func (m *Manager) lockHomeWebsocketSession(ctx context.Context, opts cliproxyexecutor.Options) func() {
-	if m == nil || !cliproxyexecutor.DownstreamWebsocket(ctx) {
+	if m == nil {
 		return nil
 	}
-	sessionID := homeExecutionSessionIDFromMetadata(opts.Metadata)
+	sessionID := homeWebsocketSessionID(ctx, opts)
 	if sessionID == "" {
 		return nil
 	}
@@ -542,10 +549,10 @@ func (m *Manager) lockHomeWebsocketSession(ctx context.Context, opts cliproxyexe
 }
 
 func (m *Manager) retainedHomeSessionSelection(ctx context.Context, opts cliproxyexecutor.Options, model string, excludedAuthIDs map[string]struct{}) (*HomeDispatchSelection, bool, error) {
-	if m == nil || !cliproxyexecutor.DownstreamWebsocket(ctx) {
+	if m == nil {
 		return nil, false, nil
 	}
-	sessionID := homeExecutionSessionIDFromMetadata(opts.Metadata)
+	sessionID := homeWebsocketSessionID(ctx, opts)
 	credentialID := pinnedAuthIDFromMetadata(opts.Metadata)
 	if sessionID == "" {
 		return nil, false, nil
@@ -664,14 +671,14 @@ func (m *Manager) endHomeSelectionBeforeRedispatch(ctx context.Context, selectio
 }
 
 func (m *Manager) retainHomeWebsocketSelection(ctx context.Context, opts cliproxyexecutor.Options, model string, selection *HomeDispatchSelection) bool {
-	if m == nil || selection == nil || !selection.Retained() || !cliproxyexecutor.DownstreamWebsocket(ctx) {
+	if m == nil || selection == nil || !selection.Retained() {
 		return false
 	}
 	selectionAuth := selection.CloneAuth()
 	if selectionAuth == nil {
 		return false
 	}
-	sessionID := homeExecutionSessionIDFromMetadata(opts.Metadata)
+	sessionID := homeWebsocketSessionID(ctx, opts)
 	credentialID := strings.TrimSpace(selectionAuth.ID)
 	routeModel, validRouteModel := validCanonicalHomeConcurrencyModelKey(model)
 	if selection.accountedModel == "" {
@@ -770,14 +777,14 @@ func (m *Manager) clearHomeRuntimeAuthsForSessionLocked(sessionID string) {
 }
 
 func (m *Manager) bindHomeSelectionRuntimeAuth(ctx context.Context, opts cliproxyexecutor.Options, selection *HomeDispatchSelection) error {
-	if m == nil || selection == nil || !cliproxyexecutor.DownstreamWebsocket(ctx) {
+	if m == nil || selection == nil {
 		return nil
 	}
 	selectionAuth := selection.CloneAuth()
 	if selectionAuth == nil || !authWebsocketsEnabled(selectionAuth) {
 		return nil
 	}
-	sessionID := homeExecutionSessionIDFromMetadata(opts.Metadata)
+	sessionID := homeWebsocketSessionID(ctx, opts)
 	authID := strings.TrimSpace(selectionAuth.ID)
 	if sessionID == "" || authID == "" || !selection.runtimeAuthBound.CompareAndSwap(false, true) {
 		return nil
@@ -970,7 +977,7 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 	if retainedOK {
 		return retained, nil
 	}
-	if sessionID := homeExecutionSessionIDFromMetadata(opts.Metadata); sessionID != "" {
+	if sessionID := homeWebsocketSessionID(ctx, opts); sessionID != "" {
 		if pinnedAuthID != "" {
 			if errEnd := m.endMismatchedHomeSessionSelections(ctx, sessionID, pinnedAuthID, requestedModel, true); errEnd != nil {
 				return nil, errEnd
@@ -1194,8 +1201,8 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 	if envelope.Present {
 		selection.accountedModel = envelope.Tuple.Model
 	}
-	if executionSessionID := homeExecutionSessionIDFromMetadata(opts.Metadata); executionSessionID != "" && cliproxyexecutor.DownstreamWebsocket(ctx) {
-		if errEnd := m.endMismatchedHomeSessionSelections(ctx, executionSessionID, strings.TrimSpace(auth.ID), requestedModel, true); errEnd != nil {
+	if sessionID := homeWebsocketSessionID(ctx, opts); sessionID != "" {
+		if errEnd := m.endMismatchedHomeSessionSelections(ctx, sessionID, strings.TrimSpace(auth.ID), requestedModel, true); errEnd != nil {
 			selection.End("target_change_release_failed")
 			return nil, errEnd
 		}

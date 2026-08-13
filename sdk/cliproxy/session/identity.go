@@ -21,6 +21,7 @@ const (
 	identityVersion      = "cpa-session-root-v1"
 	identityPrefix       = "ctx:v1:"
 	instructionRuneLimit = 50
+	claudeCodeMainAgent  = "main"
 )
 
 var legacyClaudeSessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
@@ -57,6 +58,39 @@ func NormalizeExplicitID(raw string) string {
 
 // ClaudeMetadataIdentities extracts session_id, parent_session_id, and agent_id from Claude user_id metadata.
 func ClaudeMetadataIdentities(payload []byte) (sessionID, parentSessionID, agentID string) {
+	rawSessionID, rawParentSessionID, rawAgentID := claudeMetadataIdentitiesRaw(payload)
+	return NormalizeExplicitID(rawSessionID), NormalizeExplicitID(rawParentSessionID), NormalizeExplicitID(rawAgentID)
+}
+
+// ClaudeCodeExecutionScope returns the original opaque Claude Code session and agent identity.
+func ClaudeCodeExecutionScope(headers map[string][]string, payload []byte) string {
+	metadataSessionID, _, metadataAgentID := claudeMetadataIdentitiesRaw(payload)
+
+	sessionID := rawHeaderValue(headers, "X-Claude-Code-Session-Id")
+	if sessionID == "" {
+		sessionID = metadataSessionID
+	}
+	agentID := rawHeaderValue(headers, "X-Claude-Code-Agent-Id")
+	if agentID == "" {
+		agentID = metadataAgentID
+	}
+	return ClaudeCodeExecutionScopeForIDs(sessionID, agentID)
+}
+
+// ClaudeCodeExecutionScopeForIDs encodes opaque session and agent IDs without delimiter collisions.
+func ClaudeCodeExecutionScopeForIDs(sessionID string, agentID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return ""
+	}
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		agentID = claudeCodeMainAgent
+	}
+	return fmt.Sprintf("claude:v1:%d:%s:agent:%d:%s", len(sessionID), sessionID, len(agentID), agentID)
+}
+
+func claudeMetadataIdentitiesRaw(payload []byte) (sessionID, parentSessionID, agentID string) {
 	if len(payload) == 0 {
 		return "", "", ""
 	}
@@ -73,15 +107,26 @@ func ClaudeMetadataIdentities(payload []byte) (sessionID, parentSessionID, agent
 	}
 	if strings.HasPrefix(userID, "{") {
 		parsed := gjson.Parse(userID)
-		sessionID = NormalizeExplicitID(parsed.Get("session_id").String())
-		parentSessionID = NormalizeExplicitID(parsed.Get("parent_session_id").String())
-		agentID = NormalizeExplicitID(parsed.Get("agent_id").String())
-		return sessionID, parentSessionID, agentID
+		return parsed.Get("session_id").String(), parsed.Get("parent_session_id").String(), parsed.Get("agent_id").String()
 	}
 	if matches := legacyClaudeSessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
-		return NormalizeExplicitID(matches[1]), "", ""
+		return matches[1], "", ""
 	}
 	return "", "", ""
+}
+
+func rawHeaderValue(headers map[string][]string, name string) string {
+	for key, values := range headers {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 // ClaudeMetadataSessionID extracts the explicit Claude Code session from
@@ -123,6 +168,12 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (clipro
 	if len(payload) == 0 && len(req.Payload) > 0 {
 		opts.OriginalRequest = bytes.Clone(req.Payload)
 		payload = opts.OriginalRequest
+	}
+	req.Metadata = metadataWithoutKey(req.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey)
+	opts.Metadata = metadataWithoutKey(opts.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey)
+	if scope := ClaudeCodeExecutionScope(opts.Headers, payload); scope != "" {
+		req.Metadata = metadataWithValue(req.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey, scope)
+		opts.Metadata = metadataWithValue(opts.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey, scope)
 	}
 	if executionID := firstNormalizedMetadataID(cliproxyexecutor.ExecutionSessionMetadataKey, opts.Metadata, req.Metadata); executionID != "" {
 		req.Metadata = metadataWithValue(metadataWithoutKey(req.Metadata, cliproxyexecutor.DerivedSessionIDMetadataKey), cliproxyexecutor.ExecutionSessionMetadataKey, executionID)

@@ -297,7 +297,12 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerPrefersWebsocketTransport(providerKey) && pinnedAuthID == ""
+	preferWebsocketAcrossPriorities := cliproxyexecutor.DownstreamWebsocket(ctx) && providerPrefersWebsocketTransport(providerKey) && pinnedAuthID == ""
+	preferWebsocketAtPriority := preferWebsocketAcrossPriorities || (pinnedAuthID == "" && requestPrefersCodexWebsocket(ctx, providerKey, opts))
+	affinityKey := ""
+	if !preferWebsocketAcrossPriorities && preferWebsocketAtPriority {
+		affinityKey = codexWebsocketAffinityKey(opts)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -313,7 +318,7 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
-	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
+	if picked := shard.pickReadyLocked(preferWebsocketAcrossPriorities, preferWebsocketAtPriority, affinityKey, strategy, predicate); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -374,7 +379,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 		shard := providerState.ensureModelLocked(modelKey, time.Now())
 		predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
-		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
+		if picked := shard.pickReadyLocked(false, false, "", strategy, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -414,7 +419,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, "", bestPriority, strategy, predicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -504,7 +509,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := shard.pickReadyAtPriorityLocked(false, "", bestPriority, schedulerStrategyRoundRobin, predicate)
 		if picked == nil {
 			continue
 		}
@@ -965,16 +970,16 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(preferWebsocketAcrossPriorities bool, preferWebsocketAtPriority bool, affinityKey string, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
 	m.promoteExpiredLocked(time.Now())
-	priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocket, predicate)
+	priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocketAcrossPriorities, predicate)
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+	return m.pickReadyAtPriorityLocked(preferWebsocketAtPriority, affinityKey, priorityReady, strategy, predicate)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -1010,7 +1015,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, affinityKey string, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -1019,17 +1024,22 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		return nil
 	}
 	view := &bucket.all
-	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
+	usingWebsocketView := preferWebsocket && bucket.ws.pickFirst(predicate) != nil
+	if usingWebsocketView {
 		view = &bucket.ws
 	}
 	var picked *scheduledAuth
-	switch strategy {
-	case schedulerStrategyFillFirst:
-		picked = view.pickFirst(predicate)
-	case schedulerStrategyWeightedRoundRobin:
-		picked = view.pickWeighted(predicate)
-	default:
-		picked = view.pickRoundRobin(predicate)
+	if affinityKey != "" && usingWebsocketView && strategy != schedulerStrategyFillFirst {
+		picked = view.pickStableCodexWebsocket(affinityKey, strategy == schedulerStrategyWeightedRoundRobin, predicate)
+	} else {
+		switch strategy {
+		case schedulerStrategyFillFirst:
+			picked = view.pickFirst(predicate)
+		case schedulerStrategyWeightedRoundRobin:
+			picked = view.pickWeighted(predicate)
+		default:
+			picked = view.pickRoundRobin(predicate)
+		}
 	}
 	if picked == nil || picked.auth == nil {
 		return nil
@@ -1320,6 +1330,25 @@ func (v *readyView) pickWeighted(predicate func(*scheduledAuth) bool) *scheduled
 	}
 	v.weightedState.prepare(scheduledWeightVectorMatching(v.flat, predicate))
 	return pickSmoothWeightedScheduled(v.flat, v.weightedState.current, predicate)
+}
+
+func (v *readyView) pickStableCodexWebsocket(affinityKey string, weighted bool, predicate func(*scheduledAuth) bool) *scheduledAuth {
+	var selected *scheduledAuth
+	var selectedScore float64
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil || entry.meta == nil || (predicate != nil && !predicate(entry)) {
+			continue
+		}
+		score, ok := codexWebsocketAffinityScore(affinityKey, entry.auth.ID, entry.meta.weight, weighted)
+		if !ok {
+			continue
+		}
+		if selected == nil || score > selectedScore || (score == selectedScore && entry.auth.ID < selected.auth.ID) {
+			selected = entry
+			selectedScore = score
+		}
+	}
+	return selected
 }
 
 func scheduledWeightVector(entries []*scheduledAuth) map[string]int64 {
