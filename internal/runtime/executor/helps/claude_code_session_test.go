@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -57,6 +58,19 @@ func TestExtractClaudeCodeSessionIDPrefersHeaderOverPayload(t *testing.T) {
 	got := ExtractClaudeCodeSessionID(context.Background(), payload, headers)
 	if got != "header-session" {
 		t.Fatalf("ExtractClaudeCodeSessionID() = %q, want header-session", got)
+	}
+}
+
+func TestClaudeCodeExecutionScopePreservesOpaqueExplicitIDs(t *testing.T) {
+	sessionID := strings.Repeat("s", 257)
+	agentID := strings.Repeat("a", 257)
+	headers := http.Header{}
+	headers.Set(ClaudeCodeSessionHeader, sessionID)
+	headers.Set(ClaudeCodeAgentHeader, agentID)
+	scope, ok := ClaudeCodeExecutionScope(context.Background(), nil, headers)
+	want := "claude:" + sessionID + ":agent:" + agentID
+	if !ok || scope != want {
+		t.Fatalf("opaque scope = %q, %v; want %q, true", scope, ok, want)
 	}
 }
 
