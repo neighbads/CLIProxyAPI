@@ -95,7 +95,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		authType, authValue = auth.AccountInfo()
 	}
 
-	executionSessionID := executionSessionIDFromOptions(opts)
+	sessionIdentity := websocketSessionIdentityFromOptions(opts)
+	executionSessionID := sessionIdentity.ID
 	var sess *codexWebsocketSession
 	sessionLocked := false
 	unlockSession := func() {
@@ -105,10 +106,15 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 	}
 	if executionSessionID != "" {
-		sess = e.getOrCreateSession(executionSessionID)
+		sess = e.getOrCreateSessionWithMode(executionSessionID, sessionIdentity.PooledHTTP)
 		sess.reqMu.Lock()
 		sessionLocked = true
 		defer unlockSession()
+		defer func() {
+			if err != nil {
+				e.dropPooledSession(sess, "request_error")
+			}
+		}()
 	}
 
 	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
@@ -143,9 +149,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
-			if opts.ExecutionLifecycle != nil || cliproxyexecutor.DownstreamWebsocket(ctx) {
+			if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || cliproxyexecutor.DownstreamWebsocket(ctx) || (opts.ExecutionLifecycle != nil && !sessionIdentity.PooledHTTP) {
 				return resp, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
 			}
+			e.dropPooledSession(sess, "upgrade_rejected")
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -194,7 +201,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				}
 				return resp, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 			}
-			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+			e.invalidateUpstreamConnRetainingPooledSession(sess, conn, "send_error", errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 				return resp, errSend

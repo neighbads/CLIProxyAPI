@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -224,14 +226,42 @@ func authWebsocketsEnabled(auth *Auth) bool {
 	return false
 }
 
-func preferCodexWebsocketAuths(ctx context.Context, provider string, available []*Auth) []*Auth {
-	if len(available) == 0 {
-		return available
+func selectorMetadataString(metadata map[string]any, key string) string {
+	raw := metadata[key]
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []byte:
+		return strings.TrimSpace(string(value))
+	default:
+		return ""
 	}
-	if !cliproxyexecutor.DownstreamWebsocket(ctx) {
-		return available
+}
+
+func codexWebsocketAffinityKey(opts cliproxyexecutor.Options) string {
+	if opts.Alt == "responses/compact" || !strings.EqualFold(strings.TrimSpace(opts.SourceFormat.String()), "claude") {
+		return ""
 	}
+	callerScope := selectorMetadataString(opts.Metadata, cliproxyexecutor.CallerScopeMetadataKey)
+	executionScope := selectorMetadataString(opts.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey)
+	if executionScope == "" {
+		executionScope = cliproxysession.ClaudeCodeExecutionScope(opts.Headers, opts.OriginalRequest)
+	}
+	if callerScope == "" || executionScope == "" {
+		return ""
+	}
+	return strings.Join([]string{"codex-http-ws-auth:v1", callerScope, executionScope}, "\x00")
+}
+
+func requestPrefersCodexWebsocket(ctx context.Context, provider string, opts cliproxyexecutor.Options) bool {
 	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return false
+	}
+	return cliproxyexecutor.DownstreamWebsocket(ctx) || codexWebsocketAffinityKey(opts) != ""
+}
+
+func preferCodexWebsocketAuths(ctx context.Context, provider string, opts cliproxyexecutor.Options, available []*Auth, stable bool, weighted bool) []*Auth {
+	if len(available) == 0 || !requestPrefersCodexWebsocket(ctx, provider, opts) {
 		return available
 	}
 
@@ -242,10 +272,45 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 			wsEnabled = append(wsEnabled, candidate)
 		}
 	}
-	if len(wsEnabled) > 0 {
-		return wsEnabled
+	if len(wsEnabled) == 0 {
+		return available
 	}
-	return available
+	if affinityKey := codexWebsocketAffinityKey(opts); stable && !cliproxyexecutor.DownstreamWebsocket(ctx) && affinityKey != "" && len(wsEnabled) > 1 {
+		return []*Auth{stableCodexWebsocketAuth(affinityKey, wsEnabled, weighted)}
+	}
+	return wsEnabled
+}
+
+func stableCodexWebsocketAuth(affinityKey string, available []*Auth, weighted bool) *Auth {
+	var selected *Auth
+	var selectedScore float64
+	for _, candidate := range available {
+		if candidate == nil {
+			continue
+		}
+		score, ok := codexWebsocketAffinityScore(affinityKey, candidate.ID, authWeight(candidate), weighted)
+		if !ok {
+			continue
+		}
+		if selected == nil || score > selectedScore || (score == selectedScore && candidate.ID < selected.ID) {
+			selected = candidate
+			selectedScore = score
+		}
+	}
+	return selected
+}
+
+func codexWebsocketAffinityScore(affinityKey string, authID string, weight int64, weighted bool) (float64, bool) {
+	sum := sha256.Sum256([]byte(affinityKey + "\x00" + authID))
+	rawScore := binary.BigEndian.Uint64(sum[:8])
+	if !weighted {
+		return float64(rawScore), true
+	}
+	if weight <= 0 {
+		return 0, false
+	}
+	unit := (float64(rawScore) + 1) / (float64(math.MaxUint64) + 1)
+	return math.Log(unit) / float64(weight), true
 }
 
 func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
@@ -368,13 +433,15 @@ func highestPriorityAuths(auths []*Auth) []*Auth {
 
 // Pick selects the next available auth for the provider in a round-robin manner.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	now := time.Now()
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferCodexWebsocketAuths(ctx, provider, opts, available, true, false)
+	if codexWebsocketAffinityKey(opts) != "" && !cliproxyexecutor.DownstreamWebsocket(ctx) && len(available) == 1 && authWebsocketsEnabled(available[0]) {
+		return available[0], nil
+	}
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -415,12 +482,14 @@ func positiveWeightAuths(auths []*Auth) []*Auth {
 
 // Pick selects the next available auth using smooth weighted round-robin.
 func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	available, errAvailable := getAvailableAuths(positiveWeightAuths(auths), provider, model, time.Now())
 	if errAvailable != nil {
 		return nil, errAvailable
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferCodexWebsocketAuths(ctx, provider, opts, available, true, true)
+	if codexWebsocketAffinityKey(opts) != "" && !cliproxyexecutor.DownstreamWebsocket(ctx) && len(available) == 1 && authWebsocketsEnabled(available[0]) {
+		return available[0], nil
+	}
 	stateModel := weightedSelectorStateModel(ctx, model)
 	key := provider + ":" + canonicalModelKey(stateModel)
 
@@ -524,13 +593,12 @@ func saturatingAddInt64(value, delta int64) int64 {
 
 // Pick selects the first available auth for the provider in a deterministic manner.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	now := time.Now()
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferCodexWebsocketAuths(ctx, provider, opts, available, false, false)
 	return available[0], nil
 }
 

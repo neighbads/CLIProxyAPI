@@ -306,6 +306,34 @@ func TestEnrichDerivesAfterInvalidSessionIdentity(t *testing.T) {
 	}
 }
 
+func TestEnrichStoresImmutableClaudeExecutionScope(t *testing.T) {
+	sessionID := strings.Repeat("s", 257)
+	agentID := strings.Repeat("a", 257)
+	payload := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
+	headers := http.Header{}
+	headers.Set("X-Claude-Code-Session-Id", sessionID)
+	headers.Set("X-Claude-Code-Agent-Id", agentID)
+	req, opts := Enrich(
+		cliproxyexecutor.Request{Payload: payload},
+		cliproxyexecutor.Options{OriginalRequest: payload, SourceFormat: sdktranslator.FormatClaude, Headers: headers},
+	)
+	want := ClaudeCodeExecutionScopeForIDs(sessionID, agentID)
+	if got := metadataString(req.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey); got != want {
+		t.Fatalf("request Claude execution scope = %q, want %q", got, want)
+	}
+	if got := metadataString(opts.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey); got != want {
+		t.Fatalf("options Claude execution scope = %q, want %q", got, want)
+	}
+}
+
+func TestClaudeCodeExecutionScopeAvoidsOpaqueIDCollisions(t *testing.T) {
+	left := ClaudeCodeExecutionScopeForIDs("x:agent:y", "main")
+	right := ClaudeCodeExecutionScopeForIDs("x", "y:agent:main")
+	if left == "" || right == "" || left == right {
+		t.Fatalf("opaque execution scopes collide: left=%q right=%q", left, right)
+	}
+}
+
 func TestEnrichCopiesDerivedIdentityToRequestAndOptions(t *testing.T) {
 	t.Parallel()
 

@@ -90,10 +90,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	authLabel = auth.Label
 	authType, authValue = auth.AccountInfo()
 
-	executionSessionID := executionSessionIDFromOptions(opts)
+	sessionIdentity := websocketSessionIdentityFromOptions(opts)
+	executionSessionID := sessionIdentity.ID
 	var sess *codexWebsocketSession
 	if executionSessionID != "" {
-		sess = e.getOrCreateSession(executionSessionID)
+		sess = e.getOrCreateSessionWithMode(executionSessionID, sessionIdentity.PooledHTTP)
 		if sess != nil {
 			sess.reqMu.Lock()
 		}
@@ -104,6 +105,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			sess.reqMu.Unlock()
 			streamSessionLocked = false
 		}
+	}
+	dropStreamSession := func(reason string) {
+		if sess == nil {
+			return
+		}
+		e.dropPooledSession(sess, reason)
+		unlockStreamSession()
 	}
 
 	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
@@ -145,31 +153,24 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
-			if sess != nil {
-				sess.reqMu.Unlock()
-			}
-			if opts.ExecutionLifecycle != nil || cliproxyexecutor.DownstreamWebsocket(ctx) {
+			if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || cliproxyexecutor.DownstreamWebsocket(ctx) || (opts.ExecutionLifecycle != nil && !sessionIdentity.PooledHTTP) {
+				unlockStreamSession()
 				return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
 			}
+			dropStreamSession("upgrade_rejected")
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
-			if sess != nil {
-				sess.reqMu.Unlock()
-			}
+			dropStreamSession("upgrade_rejected")
 			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
-		if sess != nil {
-			sess.reqMu.Unlock()
-		}
+		dropStreamSession("dial_error")
 		return nil, errDial
 	}
 	if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
-		if sess != nil {
-			sess.reqMu.Unlock()
-		}
 		closeWebsocketAfterBindFailure(sess, conn, closer)
+		dropStreamSession("lifecycle_bind_error")
 		return nil, errBind
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
@@ -197,10 +198,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 			}
-			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+			e.invalidateUpstreamConnRetainingPooledSession(sess, conn, "send_error", errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
 				sess.clearActive(conn, readCh)
-				sess.reqMu.Unlock()
+				dropStreamSession("send_error")
 				return nil, errSend
 			}
 
@@ -210,7 +211,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				sess.clearActive(conn, readCh)
-				sess.reqMu.Unlock()
+				dropStreamSession("dial_retry_error")
 				return nil, errDialRetry
 			}
 			previousConn, previousReadCh := conn, readCh
@@ -218,8 +219,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			closer = closerRetry
 			if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
 				clearRetryActiveState(sess, previousConn, previousReadCh)
-				sess.reqMu.Unlock()
 				closeWebsocketAfterBindFailure(sess, conn, closer)
+				dropStreamSession("lifecycle_bind_error")
 				return nil, errBind
 			}
 			readCh = sess.activate(conn)
@@ -242,7 +243,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, conn, "send_error", errSendRetry)
 				sess.clearActive(conn, readCh)
-				sess.reqMu.Unlock()
+				dropStreamSession("send_retry_error")
 				return nil, errSendRetry
 			}
 			wsReqBody = wsReqBodyRetry
@@ -264,7 +265,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		defer func() {
 			if sess != nil {
 				sess.clearActive(conn, readCh)
-				unlockStreamSession()
+				if terminateErr != nil {
+					dropStreamSession(terminateReason)
+				} else {
+					unlockStreamSession()
+				}
 				return
 			}
 			logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, terminateReason, terminateErr)

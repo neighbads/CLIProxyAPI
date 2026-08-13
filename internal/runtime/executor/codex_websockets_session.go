@@ -19,6 +19,8 @@ type codexWebsocketSessionStore struct {
 	sessions map[string]*codexWebsocketSession
 }
 
+const codexPooledUpstreamSessionMetadataKey = "codex_pooled_upstream_session_id"
+
 var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
 	sessions: make(map[string]*codexWebsocketSession),
 }
@@ -47,7 +49,8 @@ func (c *websocketConnectionCloser) Close() error {
 }
 
 type codexWebsocketSession struct {
-	sessionID string
+	sessionID  string
+	pooledHTTP bool
 
 	reqMu sync.Mutex
 
@@ -401,30 +404,32 @@ func (s *codexWebsocketSession) notifyUpstreamDisconnect(err error) {
 	})
 }
 
+type codexWebsocketSessionIdentity struct {
+	ID         string
+	PooledHTTP bool
+}
+
+func websocketSessionIdentityFromOptions(opts cliproxyexecutor.Options) codexWebsocketSessionIdentity {
+	if sessionID := metadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); sessionID != "" {
+		return codexWebsocketSessionIdentity{ID: sessionID}
+	}
+	if sessionID := metadataString(opts.Metadata, codexPooledUpstreamSessionMetadataKey); sessionID != "" {
+		return codexWebsocketSessionIdentity{ID: sessionID, PooledHTTP: true}
+	}
+	return codexWebsocketSessionIdentity{}
+}
+
 func executionSessionIDFromOptions(opts cliproxyexecutor.Options) string {
-	if len(opts.Metadata) == 0 {
-		return ""
-	}
-	raw, ok := opts.Metadata[cliproxyexecutor.ExecutionSessionMetadataKey]
-	if !ok || raw == nil {
-		return ""
-	}
-	switch v := raw.(type) {
-	case string:
-		return strings.TrimSpace(v)
-	case []byte:
-		return strings.TrimSpace(string(v))
-	default:
-		return ""
-	}
+	return websocketSessionIdentityFromOptions(opts).ID
 }
 
 func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWebsocketSession {
+	return e.getOrCreateSessionWithMode(sessionID, false)
+}
+
+func (e *CodexWebsocketsExecutor) getOrCreateSessionWithMode(sessionID string, pooledHTTP bool) *codexWebsocketSession {
 	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return nil
-	}
-	if e == nil {
+	if sessionID == "" || e == nil {
 		return nil
 	}
 	store := e.store
@@ -437,14 +442,37 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 		store.sessions = make(map[string]*codexWebsocketSession)
 	}
 	if sess, ok := store.sessions[sessionID]; ok && sess != nil {
+		if !pooledHTTP {
+			sess.pooledHTTP = false
+		}
 		return sess
 	}
 	sess := &codexWebsocketSession{
 		sessionID:            sessionID,
+		pooledHTTP:           pooledHTTP,
 		upstreamDisconnectCh: make(chan error, 1),
 	}
 	store.sessions[sessionID] = sess
 	return sess
+}
+
+func (e *CodexWebsocketsExecutor) dropPooledSession(sess *codexWebsocketSession, reason string) {
+	if e == nil || sess == nil {
+		return
+	}
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	pooled := sess.pooledHTTP
+	if pooled && store.sessions[sess.sessionID] == sess {
+		delete(store.sessions, sess.sessionID)
+	}
+	store.mu.Unlock()
+	if pooled {
+		closeCodexWebsocketSession(sess, reason)
+	}
 }
 
 func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {
@@ -524,11 +552,15 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
 		msgType, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
+			ch, done := sess.activeForConn(conn)
 			invalidate := func() {
+				if ch != nil {
+					e.invalidateUpstreamConnRetainingPooledSession(sess, conn, "upstream_disconnected", errRead)
+					return
+				}
 				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
 			}
 			invalidated := false
-			ch, done := sess.activeForConn(conn)
 			if ch != nil {
 				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
 				if sess.clearActive(conn, ch) {
@@ -575,14 +607,18 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 }
 
 func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
-	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, true)
+	e.invalidateUpstreamConnWithOptions(sess, conn, reason, err, true, true)
+}
+
+func (e *CodexWebsocketsExecutor) invalidateUpstreamConnRetainingPooledSession(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
+	e.invalidateUpstreamConnWithOptions(sess, conn, reason, err, true, false)
 }
 
 func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithoutDisconnectNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
-	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, false)
+	e.invalidateUpstreamConnWithOptions(sess, conn, reason, err, false, true)
 }
 
-func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, notify bool) {
+func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithOptions(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, notify bool, dropPooled bool) {
 	if sess == nil || conn == nil {
 		return
 	}
@@ -606,6 +642,18 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 		sess.readerConn = nil
 	}
 	sess.connMu.Unlock()
+
+	if sess.pooledHTTP && dropPooled {
+		store := e.store
+		if store == nil {
+			store = globalCodexWebsocketSessionStore
+		}
+		store.mu.Lock()
+		if store.sessions[sessionID] == sess {
+			delete(store.sessions, sessionID)
+		}
+		store.mu.Unlock()
+	}
 
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
 	if notify {

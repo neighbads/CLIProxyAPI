@@ -21,6 +21,7 @@ const (
 	identityVersion      = "cpa-session-root-v1"
 	identityPrefix       = "ctx:v1:"
 	instructionRuneLimit = 50
+	claudeCodeMainAgent  = "main"
 )
 
 var legacyClaudeSessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
@@ -59,6 +60,32 @@ func NormalizeExplicitID(raw string) string {
 // current JSON metadata or the legacy user_id suffix before bounding the
 // surrounding metadata container.
 func ClaudeMetadataSessionID(payload []byte) string {
+	return NormalizeExplicitID(claudeMetadataSessionID(payload))
+}
+
+// ClaudeCodeExecutionScope returns the original opaque Claude Code session and agent identity.
+func ClaudeCodeExecutionScope(headers map[string][]string, payload []byte) string {
+	sessionID := strings.TrimSpace(rawHeaderValue(headers, "X-Claude-Code-Session-Id"))
+	if sessionID == "" {
+		sessionID = claudeMetadataSessionID(payload)
+	}
+	return ClaudeCodeExecutionScopeForIDs(sessionID, rawHeaderValue(headers, "X-Claude-Code-Agent-Id"))
+}
+
+// ClaudeCodeExecutionScopeForIDs encodes opaque session and agent IDs without delimiter collisions.
+func ClaudeCodeExecutionScopeForIDs(sessionID string, agentID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return ""
+	}
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		agentID = claudeCodeMainAgent
+	}
+	return fmt.Sprintf("claude:v1:%d:%s:agent:%d:%s", len(sessionID), sessionID, len(agentID), agentID)
+}
+
+func claudeMetadataSessionID(payload []byte) string {
 	if len(payload) == 0 {
 		return ""
 	}
@@ -67,10 +94,24 @@ func ClaudeMetadataSessionID(payload []byte) string {
 		return ""
 	}
 	if strings.HasPrefix(userID, "{") {
-		return NormalizeExplicitID(gjson.Get(userID, "session_id").String())
+		return strings.TrimSpace(gjson.Get(userID, "session_id").String())
 	}
 	if matches := legacyClaudeSessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
-		return NormalizeExplicitID(matches[1])
+		return strings.TrimSpace(matches[1])
+	}
+	return ""
+}
+
+func rawHeaderValue(headers map[string][]string, name string) string {
+	for key, values := range headers {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
 	}
 	return ""
 }
@@ -100,6 +141,12 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (clipro
 	if len(payload) == 0 && len(req.Payload) > 0 {
 		opts.OriginalRequest = bytes.Clone(req.Payload)
 		payload = opts.OriginalRequest
+	}
+	req.Metadata = metadataWithoutKey(req.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey)
+	opts.Metadata = metadataWithoutKey(opts.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey)
+	if scope := ClaudeCodeExecutionScope(opts.Headers, payload); scope != "" {
+		req.Metadata = metadataWithValue(req.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey, scope)
+		opts.Metadata = metadataWithValue(opts.Metadata, cliproxyexecutor.ClaudeCodeExecutionScopeMetadataKey, scope)
 	}
 	if executionID := firstNormalizedMetadataID(cliproxyexecutor.ExecutionSessionMetadataKey, opts.Metadata, req.Metadata); executionID != "" {
 		req.Metadata = metadataWithValue(metadataWithoutKey(req.Metadata, cliproxyexecutor.DerivedSessionIDMetadataKey), cliproxyexecutor.ExecutionSessionMetadataKey, executionID)
