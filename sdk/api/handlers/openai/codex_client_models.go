@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"github.com/gin-gonic/gin"
 	codexmodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/models"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 )
@@ -12,6 +13,18 @@ func (h *OpenAIAPIHandler) codexClientModelsResponse(clientVersion ...string) ma
 	}
 	optimizeMultiAgentV2 := h != nil && h.Cfg != nil && h.Cfg.CodexOptimizeMultiAgentV2
 	return codexmodels.BuildResponseForClient(h.Models(), registry.GetGlobalRegistry().GetModelProviders, optimizeMultiAgentV2, version)
+}
+
+// codexClientModelsResponseWithPolicy builds the Codex client catalog while hiding models
+// the client key can never use.
+func (h *OpenAIAPIHandler) codexClientModelsResponseWithPolicy(c *gin.Context, clientVersion ...string) map[string]any {
+	version := ""
+	if len(clientVersion) > 0 {
+		version = clientVersion[0]
+	}
+	optimizeMultiAgentV2 := h != nil && h.Cfg != nil && h.Cfg.CodexOptimizeMultiAgentV2
+	filteredModels := h.FilterModelsForAPIKeyPolicy(c, h.Models())
+	return codexmodels.BuildResponseForClient(filteredModels, registry.GetGlobalRegistry().GetModelProviders, optimizeMultiAgentV2, version)
 }
 
 // CodexClientModelsResponse builds a Codex client model response.

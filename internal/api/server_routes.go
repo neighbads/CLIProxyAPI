@@ -60,7 +60,7 @@ func (s *Server) setupRoutes() {
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
-	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(AuthMiddleware(s.accessManager, s.apiKeyPolicyResolver))
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -82,8 +82,8 @@ func (s *Server) setupRoutes() {
 		v1.GET("/live/:call_id", s.codexLiveHandler.HandleSideband)
 	}
 
-	realtimeAuth := realtimeAuthMiddleware(s.accessManager, s.codexLiveHandler)
-	standardAuth := realtimeStandardAuthMiddleware(s.accessManager)
+	realtimeAuth := realtimeAuthMiddleware(s.accessManager, s.codexLiveHandler, s.apiKeyPolicyResolver)
+	standardAuth := realtimeStandardAuthMiddleware(s.accessManager, s.apiKeyPolicyResolver)
 	s.engine.GET("/v1/realtime", realtimeAuth, s.codexLiveHandler.HandleRealtimeWebsocket)
 	s.engine.POST("/v1/realtime", realtimeAuth, s.codexLiveHandler.Handle)
 	s.engine.POST("/v1/realtime/calls", realtimeAuth, s.codexLiveHandler.Handle)
@@ -100,7 +100,7 @@ func (s *Server) setupRoutes() {
 	s.engine.POST("/v1/realtime/calls/:call_id/refer", standardAuth, s.codexLiveHandler.HandleSIPControl)
 
 	openaiV1 := s.engine.Group("/openai/v1")
-	openaiV1.Use(AuthMiddleware(s.accessManager))
+	openaiV1.Use(AuthMiddleware(s.accessManager, s.apiKeyPolicyResolver))
 	{
 		openaiV1.POST("/videos", openaiHandlers.VideosCreate)
 		openaiV1.GET("/videos/:video_id/content", openaiHandlers.VideosContent)
@@ -109,7 +109,7 @@ func (s *Server) setupRoutes() {
 
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
 	codexDirect := s.engine.Group("/backend-api/codex")
-	codexDirect.Use(AuthMiddleware(s.accessManager))
+	codexDirect.Use(AuthMiddleware(s.accessManager, s.apiKeyPolicyResolver))
 	{
 		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
@@ -119,7 +119,7 @@ func (s *Server) setupRoutes() {
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
-	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(AuthMiddleware(s.accessManager, s.apiKeyPolicyResolver))
 	{
 		v1beta.GET("/models", s.geminiModelsHandler(geminiHandlers))
 		v1beta.POST("/interactions", geminiHandlers.Interactions)
@@ -363,6 +363,10 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		return
 	}
 	selectionOpts := coreexecutor.Options{Headers: selectionHeaders, OriginalRequest: body}
+	// This endpoint selects a credential itself instead of going through the shared handler
+	// execution chain, so the authenticated client key's policy has to be attached here.
+	selectionOpts.EnsureMetadata()
+	s.handlers.AttachAPIKeyPolicyMetadata(c, selectionOpts.Metadata)
 	var selection *auth.HomeDispatchSelection
 	var selected *auth.Auth
 	if s.handlers.AuthManager.HomeEnabled() {
@@ -558,7 +562,7 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 	s.wsRoutes[trimmed] = struct{}{}
 	s.wsRouteMu.Unlock()
 
-	authMiddleware := AuthMiddleware(s.accessManager)
+	authMiddleware := AuthMiddleware(s.accessManager, s.apiKeyPolicyResolver)
 	conditionalAuth := func(c *gin.Context) {
 		if !s.wsAuthEnabled.Load() {
 			c.Next()
@@ -651,17 +655,60 @@ func grokModelsFromRegistryInfos(infos []*registry.ModelInfo) []grokbuild.ModelI
 }
 
 func (s *Server) handleGrokModels(c *gin.Context) {
+	var ids []string
 	var models []grokbuild.ModelInfo
 	if s != nil && s.cfg != nil && s.cfg.Home.Enabled {
 		entries, ok := s.loadHomeModelEntries(c)
 		if !ok {
 			return
 		}
+		ids = homeModelEntryIDs(entries)
 		models = grokModelsFromHomeEntries(entries)
 	} else {
-		models = grokModelsFromRegistryInfos(registry.GetGlobalRegistry().GetAvailableModelInfos())
+		infos := registry.GetGlobalRegistry().GetAvailableModelInfos()
+		ids = make([]string, 0, len(infos))
+		for _, info := range infos {
+			if info != nil {
+				ids = append(ids, info.ID)
+			}
+		}
+		models = grokModelsFromRegistryInfos(infos)
 	}
+	models = filterGrokModelsByAPIKeyPolicy(s, c, ids, models)
 	s.writeModelListResponse(c, "openai", grokbuild.BuildResponse(models))
+}
+
+// homeModelEntryIDs returns the outward model identifiers of a Home catalog.
+func homeModelEntryIDs(entries []homeModelEntry) []string {
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		ids = append(ids, entry.id)
+	}
+	return ids
+}
+
+// filterGrokModelsByAPIKeyPolicy drops models the authenticated client key cannot use. The
+// identifiers are kept alongside the built entries so the policy is evaluated on the model ID
+// instead of its display metadata.
+func filterGrokModelsByAPIKeyPolicy(s *Server, c *gin.Context, ids []string, models []grokbuild.ModelInfo) []grokbuild.ModelInfo {
+	if s == nil || s.handlers == nil || len(models) == 0 {
+		return models
+	}
+	keep := s.handlers.APIKeyPolicyModelFilter(c)
+	if keep == nil {
+		return models
+	}
+	filtered := make([]grokbuild.ModelInfo, 0, len(models))
+	for index, model := range models {
+		modelID := model.ID
+		if index < len(ids) {
+			modelID = ids[index]
+		}
+		if keep(modelID) {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
 }
 
 func (s *Server) writeModelListResponse(c *gin.Context, sourceFormat string, payload any) {
@@ -684,6 +731,7 @@ func (s *Server) handleHomeCodexClientModels(c *gin.Context, clientVersion strin
 	for _, entry := range entries {
 		models = append(models, formatHomeCodexModel(entry))
 	}
+	models = s.handlers.FilterModelsForAPIKeyPolicy(c, models)
 
 	var webSearchCapabilityForModel codexmodels.WebSearchCapabilityForModelFunc
 	if clientVersion == "cpa" {
@@ -779,7 +827,8 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 
 	if isClaude {
 		disableCloaking := s.cfg != nil && s.cfg.ClaudeCode.DisableCloakingModelList
-		s.writeModelListResponse(c, "claude", claudemodels.BuildResponse(formatHomeClaudeModels(entries), disableCloaking))
+		models := s.handlers.FilterModelsForAPIKeyPolicy(c, formatHomeClaudeModels(entries))
+		s.writeModelListResponse(c, "claude", claudemodels.BuildResponse(models, disableCloaking))
 		return
 	}
 
@@ -797,6 +846,7 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 		}
 		filtered = append(filtered, model)
 	}
+	filtered = s.handlers.FilterModelsForAPIKeyPolicy(c, filtered)
 	s.writeModelListResponse(c, "openai", gin.H{
 		"object": "list",
 		"data":   filtered,
@@ -845,8 +895,9 @@ func (s *Server) handleHomeGeminiModels(c *gin.Context) {
 		return
 	}
 
+	models := s.handlers.FilterModelsForAPIKeyPolicy(c, formatHomeGeminiModels(entries))
 	s.writeModelListResponse(c, "gemini", gin.H{
-		"models": formatHomeGeminiModels(entries),
+		"models": models,
 	})
 }
 
@@ -859,10 +910,16 @@ func (s *Server) handleHomeGeminiModel(c *gin.Context) {
 	action := strings.TrimPrefix(c.Param("action"), "/")
 	action = strings.TrimSpace(action)
 	for _, entry := range entries {
-		if homeGeminiModelMatches(entry, action) {
-			c.JSON(http.StatusOK, formatHomeGeminiModel(entry))
-			return
+		if !homeGeminiModelMatches(entry, action) {
+			continue
 		}
+		// A model hidden from the list must not be reachable through the single-model
+		// endpoint either; it answers the same not-found shape as an unknown model.
+		if !s.handlers.ModelAllowedByAPIKeyPolicy(c, entry.id) {
+			break
+		}
+		c.JSON(http.StatusOK, formatHomeGeminiModel(entry))
+		return
 	}
 
 	c.JSON(http.StatusNotFound, handlers.ErrorResponse{
