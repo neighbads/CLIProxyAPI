@@ -167,6 +167,9 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	if accessConfigApplied || exampleAPIKeySafeModeRequired {
 		s.exampleAPIKeySafeModeActive.Store(exampleAPIKeySafeModeRequired)
 	}
+	// Publish the reloaded per-client policies before s.cfg is replaced so an in-flight
+	// authentication always resolves against a fully compiled index.
+	s.setAPIKeyPolicies(cfg)
 	s.cfgMu.Lock()
 	s.cfg = cfg
 	s.cfgMu.Unlock()
