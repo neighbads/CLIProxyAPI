@@ -63,6 +63,15 @@ type Server struct {
 	// accessManager handles request authentication providers.
 	accessManager *sdkaccess.Manager
 
+	// apiKeyPolicyResolver resolves per-client API key restrictions from the active
+	// configuration.
+	apiKeyPolicyResolver APIKeyPolicyResolver
+
+	// apiKeyPolicies holds the compiled, immutable per-client policy index. It is replaced
+	// wholesale on config reload and read through an atomic pointer so authentication never
+	// races with a concurrent reload or observes a partially updated policy.
+	apiKeyPolicies atomic.Pointer[map[string]*config.APIKeyPolicySet]
+
 	// requestLogger is the request logger instance for dynamic configuration updates.
 	requestLogger logging.RequestLogger
 	loggerToggle  func(bool)
@@ -183,6 +192,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
+	s.setAPIKeyPolicies(cfg)
+	s.apiKeyPolicyResolver = s.resolveAPIKeyPolicy
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	s.exampleAPIKeySafeModeActive.Store(s.exampleAPIKeySafeModeRequired(cfg))
 	s.handlers.SetPluginHost(optionState.pluginHost)
