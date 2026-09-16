@@ -196,6 +196,7 @@ func (h *Handler) Handle(c *gin.Context) {
 		return
 	}
 	upstreamBody, upstreamContentType, model, errPayload := prepareCallRequest(body, c.GetHeader("Content-Type"))
+	rawModel := model
 	if errPayload == nil {
 		upstreamBody, upstreamContentType, model, errPayload = applyClientSecretCallSession(upstreamBody, upstreamContentType, model, clientSecretSession(c))
 	}
@@ -220,7 +221,7 @@ func (h *Handler) Handle(c *gin.Context) {
 		OriginalRequest: body,
 	}
 	ctx = handlers.EnrichContextWithSessionHierarchy(ctx, selectionOpts.Headers, body, nil)
-	selection, selected, errSelect := h.selectOAuth(ctx, model, selectionOpts)
+	selection, selected, errSelect := h.selectOAuth(ctx, model, selectionOpts, rawModel)
 	if errSelect != nil {
 		writeSelectionError(c, errSelect)
 		return
@@ -486,7 +487,27 @@ func mediaCredentialName(selected *auth.Auth, authIndex string) string {
 	return strings.TrimSpace(authIndex)
 }
 
-func (h *Handler) selectOAuth(ctx context.Context, model string, opts coreexecutor.Options) (*auth.HomeDispatchSelection, *auth.Auth, error) {
+type modelPolicyError struct {
+	message string
+}
+
+func (e *modelPolicyError) Error() string   { return e.message }
+func (e *modelPolicyError) StatusCode() int { return http.StatusForbidden }
+
+func (h *Handler) selectOAuth(ctx context.Context, model string, opts coreexecutor.Options, checkModels ...string) (*auth.HomeDispatchSelection, *auth.Auth, error) {
+	// The live/realtime endpoints select credentials themselves, so the authenticated client
+	// key's policy must be attached here; otherwise provider-instance and account exclusions
+	// would not apply on this path.
+	opts.EnsureMetadata()
+	handlers.AttachAPIKeyPolicyMetadataFromContext(ctx, opts.Metadata)
+	if policy := handlers.APIKeyPolicyFromContext(ctx); !policy.Empty() {
+		allModels := append([]string{model}, checkModels...)
+		for _, m := range allModels {
+			if requested := strings.TrimSpace(m); requested != "" && policy.DeniesModel(requested) {
+				return nil, nil, &modelPolicyError{message: fmt.Sprintf("model %s is not allowed for this API key", requested)}
+			}
+		}
+	}
 	var selection *auth.HomeDispatchSelection
 	var selected *auth.Auth
 	var errSelect error

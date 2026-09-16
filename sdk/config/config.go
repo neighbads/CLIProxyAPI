@@ -22,6 +22,9 @@ type PayloadRule = internalconfig.PayloadRule
 type PayloadFilterRule = internalconfig.PayloadFilterRule
 type PayloadModelRule = internalconfig.PayloadModelRule
 
+type APIKeyPolicy = internalconfig.APIKeyPolicy
+type APIKeyPolicySet = internalconfig.APIKeyPolicySet
+
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
 type XAIKey = internalconfig.XAIKey
