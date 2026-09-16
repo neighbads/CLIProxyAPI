@@ -54,6 +54,11 @@ type ErrorDetail struct {
 
 const idempotencyKeyMetadataKey = "idempotency_key"
 
+// APIKeyPolicyContextKey is the Gin context key holding the compiled per-client API key
+// restriction set. It is exported so the HTTP layer that authenticates the request can
+// publish the policy the handler reads back.
+const APIKeyPolicyContextKey = "apiKeyPolicy"
+
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
@@ -243,7 +248,25 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if disallowFreeAuthFromContext(ctx) {
 		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
 	}
+	if policy := requestAPIKeyPolicy(ginCtx); !policy.Empty() {
+		meta[coreexecutor.APIKeyPolicyMetadataKey] = policy
+	}
 	return meta
+}
+
+// requestAPIKeyPolicy returns the compiled per-client restriction set attached during
+// authentication. It is read from the Gin context, which is server-populated, so a client
+// cannot supply or clear this value through request metadata.
+func requestAPIKeyPolicy(ginCtx *gin.Context) *config.APIKeyPolicySet {
+	if ginCtx == nil {
+		return nil
+	}
+	value, exists := ginCtx.Get(APIKeyPolicyContextKey)
+	if !exists {
+		return nil
+	}
+	policy, _ := value.(*config.APIKeyPolicySet)
+	return policy
 }
 
 func requestClientIP(request *http.Request) string {

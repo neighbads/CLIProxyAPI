@@ -487,6 +487,11 @@ func mediaCredentialName(selected *auth.Auth, authIndex string) string {
 }
 
 func (h *Handler) selectOAuth(ctx context.Context, model string, opts coreexecutor.Options) (*auth.HomeDispatchSelection, *auth.Auth, error) {
+	// The live/realtime endpoints select credentials themselves, so the authenticated client
+	// key's policy must be attached here; otherwise provider-instance and account exclusions
+	// would not apply on this path.
+	opts.EnsureMetadata()
+	handlers.AttachAPIKeyPolicyMetadataFromContext(ctx, opts.Metadata)
 	var selection *auth.HomeDispatchSelection
 	var selected *auth.Auth
 	var errSelect error
