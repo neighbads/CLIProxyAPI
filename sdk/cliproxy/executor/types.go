@@ -21,6 +21,11 @@ const RequestPathMetadataKey = "request_path"
 // DisallowFreeAuthMetadataKey instructs auth selection to skip known free-tier credentials.
 const DisallowFreeAuthMetadataKey = "disallow_free_auth"
 
+// APIKeyPolicyMetadataKey carries the compiled per-client API key restrictions into auth
+// selection. The value is an opaque, immutable policy handle produced by the config layer;
+// it never contains the raw client key and must not be populated from client input.
+const APIKeyPolicyMetadataKey = "api_key_policy"
+
 // AuthSelectionModelMetadataKey overrides the model used only for auth selection.
 const AuthSelectionModelMetadataKey = "auth_selection_model"
 
