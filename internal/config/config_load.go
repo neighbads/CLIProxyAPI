@@ -189,6 +189,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
+	// Normalize per-client API key policies. Misconfigured entries are dropped here so a
+	// bad policy can never disable authentication for the remaining keys.
+	cfg.APIKeyPolicies = NormalizeAPIKeyPolicies(cfg.APIKeyPolicies)
+
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
