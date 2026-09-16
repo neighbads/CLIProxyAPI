@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -35,6 +36,11 @@ var corsExposedResponseHeadersJoined = strings.Join(corsExposedResponseHeaders, 
 const (
 	exampleAPIKeyManagementPath = "/management.html"
 	exampleAPIKeyManagementURL  = "/management.html?safe-mode=configure"
+
+	// apiKeyPolicyContextKey stores the compiled per-client restriction set resolved
+	// during authentication. It shares the handlers package key because the request
+	// handlers read the policy back from the same Gin context.
+	apiKeyPolicyContextKey = handlers.APIKeyPolicyContextKey
 )
 
 func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
@@ -145,18 +151,22 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
+// APIKeyPolicyResolver resolves the compiled restriction set for an authenticated client
+// API key. It returns nil when the key has no policy, which means "unrestricted".
+type APIKeyPolicyResolver func(apiKey string) *config.APIKeyPolicySet
+
 // AuthMiddleware returns a Gin middleware handler that authenticates requests
 // using the configured authentication providers. When no providers are available,
 // it allows all requests (legacy behaviour).
-func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
-	return accessAuthMiddleware(manager, false)
+func AuthMiddleware(manager *sdkaccess.Manager, policyResolver APIKeyPolicyResolver) gin.HandlerFunc {
+	return accessAuthMiddleware(manager, policyResolver, false)
 }
 
-func realtimeStandardAuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
-	return accessAuthMiddleware(manager, true)
+func realtimeStandardAuthMiddleware(manager *sdkaccess.Manager, policyResolver APIKeyPolicyResolver) gin.HandlerFunc {
+	return accessAuthMiddleware(manager, policyResolver, true)
 }
 
-func accessAuthMiddleware(manager *sdkaccess.Manager, realtimeError bool) gin.HandlerFunc {
+func accessAuthMiddleware(manager *sdkaccess.Manager, policyResolver APIKeyPolicyResolver, realtimeError bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if manager == nil {
 			c.Next()
@@ -170,6 +180,13 @@ func accessAuthMiddleware(manager *sdkaccess.Manager, realtimeError bool) gin.Ha
 				c.Set("accessProvider", result.Provider)
 				if len(result.Metadata) > 0 {
 					c.Set("accessMetadata", result.Metadata)
+				}
+				// The policy is derived from the authenticated principal, so a client
+				// cannot inject restrictions by sending an identically named field.
+				if policyResolver != nil {
+					if policy := policyResolver(result.Principal); !policy.Empty() {
+						c.Set(apiKeyPolicyContextKey, policy)
+					}
 				}
 			}
 			c.Next()
@@ -199,8 +216,8 @@ func accessAuthMiddleware(manager *sdkaccess.Manager, realtimeError bool) gin.Ha
 	}
 }
 
-func realtimeAuthMiddleware(manager *sdkaccess.Manager, handler *codexlive.Handler) gin.HandlerFunc {
-	fallback := realtimeStandardAuthMiddleware(manager)
+func realtimeAuthMiddleware(manager *sdkaccess.Manager, handler *codexlive.Handler, policyResolver APIKeyPolicyResolver) gin.HandlerFunc {
+	fallback := realtimeStandardAuthMiddleware(manager, policyResolver)
 	return func(c *gin.Context) {
 		authorization, matched, errAuthenticate := handler.AuthenticateClientSecret(c.Request)
 		if !matched {

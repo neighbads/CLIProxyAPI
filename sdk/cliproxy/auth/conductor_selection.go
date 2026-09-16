@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -58,6 +59,7 @@ type authSelectionEligibility struct {
 	requiredKind     string
 	credentialPolicy string
 	disallowFreeAuth bool
+	apiKeyPolicy     *internalconfig.APIKeyPolicySet
 }
 
 func withRequiredAuthKind(ctx context.Context, requiredKind string) context.Context {
@@ -77,7 +79,10 @@ func credentialPolicyFromContext(ctx context.Context) string {
 }
 
 func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecutor.Options) authSelectionEligibility {
-	eligibility := authSelectionEligibility{disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata)}
+	eligibility := authSelectionEligibility{
+		disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata),
+		apiKeyPolicy:     apiKeyPolicyFromMetadata(opts.Metadata),
+	}
 	if ctx != nil {
 		eligibility.requiredKind, _ = ctx.Value(requiredAuthKindContextKey{}).(string)
 		eligibility.credentialPolicy, _ = ctx.Value(credentialPolicyContextKey{}).(string)
@@ -85,6 +90,21 @@ func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecut
 	return eligibility
 }
 
+// apiKeyPolicyFromMetadata extracts the compiled per-client API key policy, if any.
+// The value is written by the HTTP layer from the authenticated principal, never from
+// client input, so an unauthenticated request can never inject a restriction.
+func apiKeyPolicyFromMetadata(meta map[string]any) *internalconfig.APIKeyPolicySet {
+	if len(meta) == 0 {
+		return nil
+	}
+	policy, _ := meta[cliproxyexecutor.APIKeyPolicyMetadataKey].(*internalconfig.APIKeyPolicySet)
+	return policy
+}
+
+// allows reports whether a credential is eligible for the current request. It is the single
+// gate shared by the fast scheduler, every legacy selector, the plugin scheduler, retry and
+// cooldown rounds, and session-affinity validation, so a forbidden credential is filtered
+// before selection instead of being rejected after it has been picked.
 func (e authSelectionEligibility) allows(auth *Auth) bool {
 	if auth == nil {
 		return false
@@ -95,7 +115,49 @@ func (e authSelectionEligibility) allows(auth *Auth) bool {
 	if e.credentialPolicy != "" && !credentialPolicyAllows(e.credentialPolicy, auth) {
 		return false
 	}
-	return !e.disallowFreeAuth || !isFreeCodexAuth(auth)
+	if e.disallowFreeAuth && isFreeCodexAuth(auth) {
+		return false
+	}
+	if e.apiKeyPolicy.Empty() {
+		return true
+	}
+	return !e.apiKeyPolicy.DeniesAuth(auth.ID, authProviderInstanceKey(auth), authAccountEmail(auth))
+}
+
+// authProviderInstanceKey returns the provider configuration api-key that identifies the
+// concrete configuration instance behind an auth record. It is intentionally not the
+// provider type, so excluding one instance leaves sibling instances of the same provider
+// available.
+func authProviderInstanceKey(auth *Auth) string {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(auth.Attributes["api_key"])
+}
+
+// authAccountEmail resolves the upstream account email using the same precedence as the
+// management auth-files view: Metadata["email"], then Attributes["email"], then
+// Attributes["account_email"].
+func authAccountEmail(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if value, ok := auth.Metadata["email"].(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	if len(auth.Attributes) > 0 {
+		if trimmed := strings.TrimSpace(auth.Attributes["email"]); trimmed != "" {
+			return trimmed
+		}
+		if trimmed := strings.TrimSpace(auth.Attributes["account_email"]); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (m *Manager) syncSchedulerFromSnapshot(auths []*Auth) {

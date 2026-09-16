@@ -951,7 +951,67 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 	return auth, executor, provider, nil
 }
 
+// pickHomeDispatchSelection selects a Home dispatch target that also satisfies the
+// authenticated client key's restrictions. It seeds the dispatched excluded ids with the
+// locally known credentials the policy forbids, then re-verifies the returned credential and
+// redispatches when Home still hands back an excluded one. The single loop covers both the
+// streaming and non-streaming execution paths because both enter through this function.
 func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	if eligibility.apiKeyPolicy.Empty() {
+		return m.pickHomeDispatchSelectionOnce(ctx, model, opts)
+	}
+
+	opts = m.withPolicyExcludedAuthIDs(opts, eligibility.apiKeyPolicy)
+	tried := make(map[string]struct{})
+	for {
+		selection, errSelection := m.pickHomeDispatchSelectionOnce(ctx, model, opts)
+		if errSelection != nil {
+			return nil, errSelection
+		}
+		auth := selection.CloneAuth()
+		if auth == nil || eligibility.allows(auth) {
+			return selection, nil
+		}
+		authID := strings.TrimSpace(auth.ID)
+		if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "api_key_policy_denied"); errEnd != nil {
+			return nil, errEnd
+		}
+		if authID == "" {
+			return nil, &Error{Code: "auth_not_found", Message: "selected auth has no ID", HTTPStatus: http.StatusServiceUnavailable}
+		}
+		if _, alreadyTried := tried[authID]; alreadyTried {
+			return nil, &Error{Code: "auth_not_found", Message: "selector repeatedly returned a policy-excluded auth", HTTPStatus: http.StatusServiceUnavailable}
+		}
+		tried[authID] = struct{}{}
+		opts = withHomeExcludedAuthIDs(opts, map[string]struct{}{authID: struct{}{}})
+	}
+}
+
+// withPolicyExcludedAuthIDs merges the locally known credentials forbidden by the policy into
+// the excluded ids sent to Home, so Home is not asked to return them in the first place.
+func (m *Manager) withPolicyExcludedAuthIDs(opts cliproxyexecutor.Options, policy *internalconfig.APIKeyPolicySet) cliproxyexecutor.Options {
+	if m == nil || policy.Empty() {
+		return opts
+	}
+	excluded := make(map[string]struct{})
+	m.mu.RLock()
+	for _, auth := range m.auths {
+		if auth == nil {
+			continue
+		}
+		if policy.DeniesAuth(auth.ID, authProviderInstanceKey(auth), authAccountEmail(auth)) {
+			excluded[auth.ID] = struct{}{}
+		}
+	}
+	m.mu.RUnlock()
+	if len(excluded) == 0 {
+		return opts
+	}
+	return withHomeExcludedAuthIDs(opts, excluded)
+}
+
+func (m *Manager) pickHomeDispatchSelectionOnce(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
 	if m == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -1268,6 +1328,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 		return nil, nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	var candidates []creditsCandidateEntry
 	m.mu.RLock()
 	for _, auth := range m.auths {
@@ -1278,6 +1339,11 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 			continue
 		}
 		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+			continue
+		}
+		// The credits fallback is a separate selection path, so the per-client policy must
+		// be applied here as well instead of relying on the scheduler predicate.
+		if !eligibility.allows(auth) {
 			continue
 		}
 		if !strings.Contains(strings.ToLower(strings.TrimSpace(routeModel)), "claude") {
