@@ -302,6 +302,8 @@ type Manager struct {
 	once     sync.Once
 	stopOnce sync.Once
 	cancel   context.CancelFunc
+	started  bool
+	done     chan struct{}
 
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -317,6 +319,7 @@ type Manager struct {
 func NewManager(buffer int) *Manager {
 	m := &Manager{}
 	m.cond = sync.NewCond(&m.mu)
+	m.done = make(chan struct{})
 	return m
 }
 
@@ -331,6 +334,7 @@ func (m *Manager) Start(ctx context.Context) {
 		}
 		var workerCtx context.Context
 		workerCtx, m.cancel = context.WithCancel(ctx)
+		m.started = true
 		go m.run(workerCtx)
 	})
 }
@@ -348,6 +352,9 @@ func (m *Manager) Stop() {
 		m.closed = true
 		m.mu.Unlock()
 		m.cond.Broadcast()
+		if m.started && m.done != nil {
+			<-m.done
+		}
 	})
 }
 
@@ -418,6 +425,9 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 }
 
 func (m *Manager) run(ctx context.Context) {
+	if m.done != nil {
+		defer close(m.done)
+	}
 	for {
 		m.mu.Lock()
 		for !m.closed && len(m.queue) == 0 {

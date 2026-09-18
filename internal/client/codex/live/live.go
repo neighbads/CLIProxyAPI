@@ -494,6 +494,13 @@ type modelPolicyError struct {
 func (e *modelPolicyError) Error() string   { return e.message }
 func (e *modelPolicyError) StatusCode() int { return http.StatusForbidden }
 
+type liveUsageLimitError struct {
+	err error
+}
+
+func (e *liveUsageLimitError) Error() string   { return e.err.Error() }
+func (e *liveUsageLimitError) StatusCode() int { return http.StatusTooManyRequests }
+
 func (h *Handler) selectOAuth(ctx context.Context, model string, opts coreexecutor.Options, checkModels ...string) (*auth.HomeDispatchSelection, *auth.Auth, error) {
 	// The live/realtime endpoints select credentials themselves, so the authenticated client
 	// key's policy must be attached here; otherwise provider-instance and account exclusions
@@ -507,6 +514,9 @@ func (h *Handler) selectOAuth(ctx context.Context, model string, opts coreexecut
 				return nil, nil, &modelPolicyError{message: fmt.Sprintf("model %s is not allowed for this API key", requested)}
 			}
 		}
+	}
+	if errLimit := handlers.EnforceAPIKeyUsageLimit(ctx); errLimit != nil {
+		return nil, nil, &liveUsageLimitError{err: errLimit.Error}
 	}
 	var selection *auth.HomeDispatchSelection
 	var selected *auth.Auth

@@ -372,6 +372,10 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		c.JSON(errPolicy.StatusCode, gin.H{"error": errPolicy.Error.Error()})
 		return
 	}
+	if errLimit := s.handlers.EnforceAPIKeyUsageLimit(ctx); errLimit != nil {
+		c.JSON(errLimit.StatusCode, gin.H{"error": errLimit.Error.Error()})
+		return
+	}
 	selectionOpts := coreexecutor.Options{Headers: selectionHeaders, OriginalRequest: body}
 	// This endpoint selects a credential itself instead of going through the shared handler
 	// execution chain, so the authenticated client key's policy has to be attached here.
