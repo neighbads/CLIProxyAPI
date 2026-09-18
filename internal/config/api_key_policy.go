@@ -6,9 +6,40 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 )
 
-// APIKeyPolicy restricts the models, provider configuration instances, and upstream
-// accounts a single client API key may use. Every restriction list is optional; an
-// empty list means the dimension is unrestricted for that key.
+// tokensPerMB is the number of tokens one "-mb" unit represents in usage limits.
+const tokensPerMB = 1_000_000
+
+// APIKeyUsageLimits caps how many tokens a client API key may consume inside a calendar
+// window. Values are expressed in millions of tokens; 0 leaves that window unlimited.
+// Windows follow the local calendar, so the day resets at local midnight and the month
+// resets on the first day of the local month.
+type APIKeyUsageLimits struct {
+	// DailyTokensMB caps the tokens consumed during the current local calendar day.
+	DailyTokensMB int `yaml:"daily-tokens-mb,omitempty" json:"daily-tokens-mb,omitempty"`
+
+	// MonthlyTokensMB caps the tokens consumed during the current local calendar month.
+	MonthlyTokensMB int `yaml:"monthly-tokens-mb,omitempty" json:"monthly-tokens-mb,omitempty"`
+}
+
+// Empty reports whether no window is capped.
+func (l APIKeyUsageLimits) Empty() bool {
+	return l.DailyTokensMB <= 0 && l.MonthlyTokensMB <= 0
+}
+
+// Normalized clamps negative values to zero, which means unlimited.
+func (l APIKeyUsageLimits) Normalized() APIKeyUsageLimits {
+	if l.DailyTokensMB < 0 {
+		l.DailyTokensMB = 0
+	}
+	if l.MonthlyTokensMB < 0 {
+		l.MonthlyTokensMB = 0
+	}
+	return l
+}
+
+// APIKeyPolicy restricts the models, provider configuration instances, upstream accounts,
+// and token usage a single client API key may consume. Every restriction is optional; an
+// empty list or a zero limit means the dimension is unrestricted for that key.
 type APIKeyPolicy struct {
 	// APIKey references an existing entry in api-keys. Policies that reference an
 	// unknown key never take effect and never authenticate a key by themselves.
@@ -25,11 +56,15 @@ type APIKeyPolicy struct {
 
 	// ExcludedAIAccounts lists upstream account emails or auth file ids the key may not use.
 	ExcludedAIAccounts []string `yaml:"excluded-ai-accounts,omitempty" json:"excluded-ai-accounts,omitempty"`
+
+	// UsageLimits caps the tokens the key may consume per calendar day and month.
+	UsageLimits APIKeyUsageLimits `yaml:"usage-limits,omitempty" json:"usage-limits,omitempty"`
 }
 
 // Empty reports whether the policy carries no restriction at all.
 func (p APIKeyPolicy) Empty() bool {
-	return len(p.ExcludedModels) == 0 && len(p.ExcludedAIProviders) == 0 && len(p.ExcludedAIAccounts) == 0
+	return len(p.ExcludedModels) == 0 && len(p.ExcludedAIProviders) == 0 && len(p.ExcludedAIAccounts) == 0 &&
+		p.UsageLimits.Empty()
 }
 
 // APIKeyPolicySet is the compiled, immutable request-scoped view of one client API key's
@@ -38,6 +73,11 @@ type APIKeyPolicySet struct {
 	excludedModels    []string
 	excludedProviders map[string]struct{}
 	excludedAccounts  map[string]struct{}
+
+	// fingerprint identifies the client key for usage accounting without carrying the key.
+	fingerprint       string
+	dailyTokenLimit   int64
+	monthlyTokenLimit int64
 }
 
 // Empty reports whether the set carries no restriction, in which case all requests pass.
@@ -45,7 +85,40 @@ func (s *APIKeyPolicySet) Empty() bool {
 	if s == nil {
 		return true
 	}
-	return len(s.excludedModels) == 0 && len(s.excludedProviders) == 0 && len(s.excludedAccounts) == 0
+	return len(s.excludedModels) == 0 && len(s.excludedProviders) == 0 && len(s.excludedAccounts) == 0 &&
+		!s.LimitsUsage()
+}
+
+// LimitsUsage reports whether the set caps token consumption in any window.
+func (s *APIKeyPolicySet) LimitsUsage() bool {
+	if s == nil {
+		return false
+	}
+	return s.fingerprint != "" && (s.dailyTokenLimit > 0 || s.monthlyTokenLimit > 0)
+}
+
+// Fingerprint returns the SHA-256 identifier the usage tracker accounts this key under.
+func (s *APIKeyPolicySet) Fingerprint() string {
+	if s == nil {
+		return ""
+	}
+	return s.fingerprint
+}
+
+// DailyTokenLimit returns the per-calendar-day token allowance, or 0 when unlimited.
+func (s *APIKeyPolicySet) DailyTokenLimit() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.dailyTokenLimit
+}
+
+// MonthlyTokenLimit returns the per-calendar-month token allowance, or 0 when unlimited.
+func (s *APIKeyPolicySet) MonthlyTokenLimit() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.monthlyTokenLimit
 }
 
 // RestrictsAuth reports whether the set excludes any credential, by provider instance or by
@@ -172,6 +245,11 @@ func (cfg *SDKConfig) APIKeyPolicySetFor(apiKey string) *APIKeyPolicySet {
 			continue
 		}
 		set := &APIKeyPolicySet{excludedModels: entry.ExcludedModels}
+		if limits := entry.UsageLimits.Normalized(); !limits.Empty() {
+			set.fingerprint = misc.APIKeyFingerprint(key)
+			set.dailyTokenLimit = int64(limits.DailyTokensMB) * tokensPerMB
+			set.monthlyTokenLimit = int64(limits.MonthlyTokensMB) * tokensPerMB
+		}
 		if len(entry.ExcludedAIProviders) > 0 {
 			set.excludedProviders = make(map[string]struct{}, len(entry.ExcludedAIProviders))
 			for _, value := range entry.ExcludedAIProviders {
@@ -214,6 +292,7 @@ func NormalizeAPIKeyPolicies(entries []APIKeyPolicy) []APIKeyPolicy {
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 		entry.ExcludedAIProviders = normalizePolicyValues(entry.ExcludedAIProviders)
 		entry.ExcludedAIAccounts = normalizePolicyValues(entry.ExcludedAIAccounts)
+		entry.UsageLimits = entry.UsageLimits.Normalized()
 		if entry.Empty() {
 			continue
 		}

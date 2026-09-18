@@ -41,6 +41,31 @@ api-keys:
   - "your-api-key-2"
   - "your-api-key-3"
 
+# Per-client restrictions. Each entry applies to one key listed in api-keys; a policy that
+# references an unknown key takes no effect and never authenticates that key by itself.
+# Every restriction is optional, and an omitted one leaves that dimension unrestricted.
+# api-key-policies:
+#   - api-key: "your-api-key-1"
+#     # Outward model IDs the key may not request. "*" matches any substring.
+#     excluded-models:
+#       - "gpt-5*"
+#     # api-key values of the provider configuration instances the key may not use.
+#     # This matches a concrete configuration instance, not a provider type.
+#     excluded-ai-providers:
+#       - "provider-instance-api-key"
+#     # Upstream account emails or auth file ids the key may not use.
+#     excluded-ai-accounts:
+#       - "account@example.com"
+#     # Token allowance, in millions of tokens (1 = 1,000,000 tokens). Windows follow the
+#     # local calendar: the daily counter resets at local midnight and the monthly counter
+#     # resets on the first day of the local month. Omit a value or set 0 to leave that
+#     # window unlimited. A request is rejected with HTTP 429 once the allowance is used up;
+#     # accounting is fed by completed requests, so the limit stops the next request rather
+#     # than truncating the one in flight.
+#     usage-limits:
+#       daily-tokens-mb: 200
+#       monthly-tokens-mb: 4000
+
 # Enable debug logging
 debug: false
 
