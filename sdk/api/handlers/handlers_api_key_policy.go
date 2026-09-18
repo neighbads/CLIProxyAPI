@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usagelimit"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -29,6 +31,35 @@ func (h *BaseAPIHandler) EnforceAPIKeyModelPolicy(ctx context.Context, modelName
 	return &interfaces.ErrorMessage{
 		StatusCode: http.StatusForbidden,
 		Error:      fmt.Errorf("model %s is not allowed for this API key", requested),
+	}
+}
+
+// apiKeyUsageTracker accounts the tokens each client key consumes. It is a package variable
+// so tests can account against a temporary tracker instead of the process-wide state file.
+var apiKeyUsageTracker = usagelimit.Default()
+
+// EnforceAPIKeyUsageLimit rejects a request once the authenticated client key has consumed
+// its token allowance for the current calendar day or month. Accounting is fed by completed
+// requests, so a limit stops the next request instead of truncating the one in flight.
+func (h *BaseAPIHandler) EnforceAPIKeyUsageLimit(ctx context.Context) *interfaces.ErrorMessage {
+	policy := h.apiKeyPolicyFromContext(ctx)
+	if !policy.LimitsUsage() {
+		return nil
+	}
+	dayTokens, monthTokens := apiKeyUsageTracker.Snapshot(policy.Fingerprint(), time.Now())
+	if limit := policy.DailyTokenLimit(); limit > 0 && dayTokens >= limit {
+		return usageLimitError("daily", dayTokens, limit)
+	}
+	if limit := policy.MonthlyTokenLimit(); limit > 0 && monthTokens >= limit {
+		return usageLimitError("monthly", monthTokens, limit)
+	}
+	return nil
+}
+
+func usageLimitError(window string, used, limit int64) *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      fmt.Errorf("%s token limit reached for this API key: %d of %d tokens used", window, used, limit),
 	}
 }
 
