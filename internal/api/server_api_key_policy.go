@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usagelimit"
 )
 
 // setAPIKeyPolicies compiles the configured per-client policies into an immutable index and
@@ -13,7 +14,25 @@ func (s *Server) setAPIKeyPolicies(cfg *config.Config) {
 	if s == nil || cfg == nil {
 		return
 	}
-	s.apiKeyPolicies.Store(buildAPIKeyPolicyIndex(&cfg.SDKConfig))
+	index := buildAPIKeyPolicyIndex(&cfg.SDKConfig)
+	s.apiKeyPolicies.Store(index)
+	// Usage accounting follows the compiled policies: only keys that carry a token allowance
+	// are tracked, so a configuration without usage limits keeps no counters at all.
+	usagelimit.Default().SetTrackedKeys(usageLimitedFingerprints(index))
+}
+
+// usageLimitedFingerprints collects the accounting identifiers of the keys that cap tokens.
+func usageLimitedFingerprints(index *map[string]*config.APIKeyPolicySet) map[string]struct{} {
+	tracked := make(map[string]struct{})
+	if index == nil {
+		return tracked
+	}
+	for _, set := range *index {
+		if set.LimitsUsage() {
+			tracked[set.Fingerprint()] = struct{}{}
+		}
+	}
+	return tracked
 }
 
 // buildAPIKeyPolicyIndex compiles the policy list into a lookup map. It returns a pointer to
