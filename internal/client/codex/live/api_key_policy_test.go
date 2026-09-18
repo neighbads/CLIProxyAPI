@@ -7,9 +7,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagelimit"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -242,6 +245,33 @@ func TestSelectOAuthAttachesAPIKeyPolicyMetadata(t *testing.T) {
 		_, _, errSelect := handler.selectOAuth(ctx, "gpt-live-1-codex", coreexecutor.Options{}, "gpt-realtime")
 		if errSelect == nil {
 			t.Fatal("selectOAuth() want error for excluded raw model, got nil")
+		}
+	})
+
+	t.Run("policy rejects over usage limit", func(t *testing.T) {
+		policy := (&internalconfig.Config{SDKConfig: internalconfig.SDKConfig{
+			APIKeys: []string{"sk-a"},
+			APIKeyPolicies: []internalconfig.APIKeyPolicy{{
+				APIKey:      "sk-a",
+				UsageLimits: internalconfig.APIKeyUsageLimits{DailyTokensMB: 1},
+			}},
+		}}).APIKeyPolicySetFor("sk-a")
+		fp := misc.APIKeyFingerprint("sk-a")
+		tracker := usagelimit.Default()
+		tracker.SetTrackedKeys(map[string]struct{}{fp: {}})
+		tracker.Add(fp, 1_000_000, time.Now())
+
+		ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ginCtx.Set(handlers.APIKeyPolicyContextKey, policy)
+		ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+		_, _, errSelect := handler.selectOAuth(ctx, "gpt-live-1-codex", coreexecutor.Options{})
+		if errSelect == nil {
+			t.Fatal("selectOAuth() want error for exceeded usage limit, got nil")
+		}
+		type statusCoder interface{ StatusCode() int }
+		if sc, ok := errSelect.(statusCoder); !ok || sc.StatusCode() != http.StatusTooManyRequests {
+			t.Fatalf("error status = %v, want 429", errSelect)
 		}
 	})
 }

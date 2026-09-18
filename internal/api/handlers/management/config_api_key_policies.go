@@ -11,9 +11,9 @@ import (
 
 // api-key-policies: []config.APIKeyPolicy
 //
-// The section restricts the models, provider configuration instances, and upstream accounts
-// each client API key may use. Writes go through the shared persist/reload path, so policy
-// changes take effect on the next request without a restart.
+// The section restricts the models, provider configuration instances, upstream accounts, and
+// token allowance each client API key may use. Writes go through the shared persist/reload
+// path, so policy changes take effect on the next request without a restart.
 
 func (h *Handler) GetAPIKeyPolicies(c *gin.Context) {
 	c.JSON(200, gin.H{"api-key-policies": config.NormalizeAPIKeyPolicies(h.cfg.APIKeyPolicies)})
@@ -44,21 +44,24 @@ func (h *Handler) PutAPIKeyPolicies(c *gin.Context) {
 
 // PatchAPIKeyPolicies upserts a single policy identified by "api-key" (or by "index").
 // Omitted restriction lists keep their current value; an explicitly supplied empty list
-// clears that dimension.
+// clears that dimension. Supplying "usage-limits" replaces both token allowances, so a
+// zero value in it lifts the limit for that window.
 func (h *Handler) PatchAPIKeyPolicies(c *gin.Context) {
 	type apiKeyPolicyPatch struct {
-		APIKey              *string   `json:"api-key"`
-		ExcludedModels      *[]string `json:"excluded-models"`
-		ExcludedAIProviders *[]string `json:"excluded-ai-providers"`
-		ExcludedAIAccounts  *[]string `json:"excluded-ai-accounts"`
+		APIKey              *string                   `json:"api-key"`
+		ExcludedModels      *[]string                 `json:"excluded-models"`
+		ExcludedAIProviders *[]string                 `json:"excluded-ai-providers"`
+		ExcludedAIAccounts  *[]string                 `json:"excluded-ai-accounts"`
+		UsageLimits         *config.APIKeyUsageLimits `json:"usage-limits"`
 	}
 	var body struct {
-		APIKey              *string            `json:"api-key"`
-		Index               *int               `json:"index"`
-		ExcludedModels      *[]string          `json:"excluded-models"`
-		ExcludedAIProviders *[]string          `json:"excluded-ai-providers"`
-		ExcludedAIAccounts  *[]string          `json:"excluded-ai-accounts"`
-		Value               *apiKeyPolicyPatch `json:"value"`
+		APIKey              *string                   `json:"api-key"`
+		Index               *int                      `json:"index"`
+		ExcludedModels      *[]string                 `json:"excluded-models"`
+		ExcludedAIProviders *[]string                 `json:"excluded-ai-providers"`
+		ExcludedAIAccounts  *[]string                 `json:"excluded-ai-accounts"`
+		UsageLimits         *config.APIKeyUsageLimits `json:"usage-limits"`
+		Value               *apiKeyPolicyPatch        `json:"value"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
@@ -77,6 +80,9 @@ func (h *Handler) PatchAPIKeyPolicies(c *gin.Context) {
 		}
 		if body.Value.ExcludedAIAccounts != nil {
 			body.ExcludedAIAccounts = body.Value.ExcludedAIAccounts
+		}
+		if body.Value.UsageLimits != nil {
+			body.UsageLimits = body.Value.UsageLimits
 		}
 	}
 
@@ -124,6 +130,9 @@ func (h *Handler) PatchAPIKeyPolicies(c *gin.Context) {
 	}
 	if body.ExcludedAIAccounts != nil {
 		entry.ExcludedAIAccounts = append([]string(nil), (*body.ExcludedAIAccounts)...)
+	}
+	if body.UsageLimits != nil {
+		entry.UsageLimits = body.UsageLimits.Normalized()
 	}
 	if entry.APIKey == "" {
 		c.JSON(400, gin.H{"error": "missing api-key"})
