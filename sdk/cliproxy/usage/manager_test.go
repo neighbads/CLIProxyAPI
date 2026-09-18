@@ -186,3 +186,26 @@ func TestManagerPublishBackfillsContextAuthFields(t *testing.T) {
 		t.Fatal("timed out waiting for usage record")
 	}
 }
+
+type recordingPlugin struct {
+	records []Record
+}
+
+func (p *recordingPlugin) HandleUsage(_ context.Context, record Record) {
+	p.records = append(p.records, record)
+}
+
+func TestManagerStopDrainsQueue(t *testing.T) {
+	m := NewManager(10)
+	plugin := &recordingPlugin{}
+	m.Register(plugin)
+	m.Start(context.Background())
+
+	m.Publish(context.Background(), Record{Model: "m1"})
+	m.Publish(context.Background(), Record{Model: "m2"})
+	m.Stop()
+
+	if len(plugin.records) != 2 {
+		t.Fatalf("len(records) = %d, want 2", len(plugin.records))
+	}
+}
