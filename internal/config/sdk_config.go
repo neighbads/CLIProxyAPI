@@ -61,6 +61,9 @@ type SDKConfig struct {
 	// accounts each client API key may use. Keys without a policy stay unrestricted.
 	APIKeyPolicies []APIKeyPolicy `yaml:"api-key-policies,omitempty" json:"api-key-policies,omitempty"`
 
+	// AccountPolicies defines in-flight concurrency limiting and queueing policies for upstream accounts.
+	AccountPolicies []AccountPolicy `yaml:"account-policies,omitempty" json:"account-policies,omitempty"`
+
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`

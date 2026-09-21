@@ -493,6 +493,12 @@ func (m *Manager) SetSelector(selector Selector) {
 	m.selector = selector
 	m.mu.Unlock()
 
+	if aware, ok := selector.(accountPoliciesAwareSelector); ok {
+		if cfg := m.runtimeConfigSnapshot(); cfg != nil && len(cfg.AccountPolicies) > 0 {
+			aware.SetAccountPolicies(cfg.AccountPolicies)
+		}
+	}
+
 	if oldSelector != nil {
 		if stoppable, ok := oldSelector.(StoppableSelector); ok {
 			stoppable.Stop()
@@ -2090,6 +2096,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 }
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	if cfg := m.runtimeConfigSnapshot(); cfg != nil && len(cfg.AccountPolicies) > 0 {
+		ctx = withAccountPolicies(ctx, cfg.AccountPolicies)
+	}
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
@@ -2203,6 +2212,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	if cfg := m.runtimeConfigSnapshot(); cfg != nil && len(cfg.AccountPolicies) > 0 {
+		ctx = withAccountPolicies(ctx, cfg.AccountPolicies)
+	}
 	opts.EnsureMetadata()
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)

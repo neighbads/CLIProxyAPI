@@ -26,6 +26,9 @@ type APIKeyPolicy = internalconfig.APIKeyPolicy
 type APIKeyPolicySet = internalconfig.APIKeyPolicySet
 type APIKeyRateLimits = internalconfig.APIKeyRateLimits
 
+type AccountPolicy = internalconfig.AccountPolicy
+type AccountRateLimits = internalconfig.AccountRateLimits
+
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
 type XAIKey = internalconfig.XAIKey
@@ -52,6 +55,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 }
 
 func ParseConfigBytes(data []byte) (*Config, error) { return internalconfig.ParseConfigBytes(data) }
+
+func NormalizeAccountPolicies(entries []AccountPolicy) []AccountPolicy {
+	return internalconfig.NormalizeAccountPolicies(entries)
+}
 
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	return internalconfig.SaveConfigPreserveComments(configFile, cfg)

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/ratelimit"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/sjson"
 )
@@ -136,6 +137,22 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
+		releaseSlot, errSlot := m.acquireAccountSlot(execCtx, auth, opts.Metadata)
+		if errSlot != nil {
+			releaseAttempt()
+			if errors.Is(errSlot, ratelimit.ErrRateLimitExceeded) {
+				lastErr = errSlot
+				roundTiming.Observe(lastErr)
+				continue
+			}
+			selection.End("account_rate_limit_error")
+			return cliproxyexecutor.Response{}, errSlot
+		}
+		var releaseSlotOnce sync.Once
+		safeReleaseSlot := func() {
+			releaseSlotOnce.Do(releaseSlot)
+		}
+		defer safeReleaseSlot()
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if aliasResult.ForceMapping && responseAlias != "" {
 			aliasResult.OriginalAlias = responseAlias
@@ -146,6 +163,7 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 		}
 		if len(models) == 0 {
 			releaseAttempt()
+			safeReleaseSlot()
 			if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "no_execution_models"); errEnd != nil {
 				return cliproxyexecutor.Response{}, errEnd
 			}
@@ -161,6 +179,7 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			}
 			m.reportHomeResult(execCtx, Result{AuthID: auth.ID, Provider: selection.Provider, Model: stateModel, RouteModel: routeModel, Success: false, Error: resultErrorFromError(errPrepare), Options: opts}, auth)
 			releaseAttempt()
+			safeReleaseSlot()
 			if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "prepare_failed"); errEnd != nil {
 				return cliproxyexecutor.Response{}, errEnd
 			}
@@ -295,6 +314,7 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 		}
 		roundTiming.Observe(lastErr)
 		releaseAttempt()
+		safeReleaseSlot()
 		if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "execution_failed"); errEnd != nil {
 			return cliproxyexecutor.Response{}, errEnd
 		}
