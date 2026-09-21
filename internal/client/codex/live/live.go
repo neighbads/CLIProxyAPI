@@ -216,10 +216,12 @@ func (h *Handler) Handle(c *gin.Context) {
 	mediaRetained := false
 
 	ctx := context.WithValue(c.Request.Context(), "gin", c)
-	selectionOpts := coreexecutor.Options{
+	selectionOpts := &coreexecutor.Options{
 		Headers:         liveSelectionHeaders(c),
 		OriginalRequest: body,
 	}
+	selectionOpts.EnsureMetadata()
+	defer auth.CleanupAcquiredSlot(selectionOpts.Metadata)
 	ctx = handlers.EnrichContextWithSessionHierarchy(ctx, selectionOpts.Headers, body, nil)
 	selection, selected, errSelect := h.selectOAuth(ctx, model, selectionOpts, rawModel)
 	if errSelect != nil {
@@ -318,7 +320,7 @@ func (h *Handler) Handle(c *gin.Context) {
 			AuthType:  authType,
 			AuthValue: authValue,
 		})
-		return h.authManager.HttpRequest(ctx, current, req)
+		return h.authManager.HttpRequestWithMetadata(ctx, current, req, selectionOpts.Metadata)
 	}
 
 	if errContext := ctx.Err(); errContext != nil {
@@ -501,36 +503,44 @@ type liveUsageLimitError struct {
 func (e *liveUsageLimitError) Error() string   { return e.err.Error() }
 func (e *liveUsageLimitError) StatusCode() int { return http.StatusTooManyRequests }
 
-func (h *Handler) selectOAuth(ctx context.Context, model string, opts coreexecutor.Options, checkModels ...string) (*auth.HomeDispatchSelection, *auth.Auth, error) {
+func (h *Handler) selectOAuth(ctx context.Context, model string, opts *coreexecutor.Options, checkModels ...string) (*auth.HomeDispatchSelection, *auth.Auth, error) {
 	// The live/realtime endpoints select credentials themselves, so the authenticated client
 	// key's policy must be attached here; otherwise provider-instance and account exclusions
 	// would not apply on this path.
+	if opts == nil {
+		opts = &coreexecutor.Options{}
+	}
 	opts.EnsureMetadata()
 	handlers.AttachAPIKeyPolicyMetadataFromContext(ctx, opts.Metadata)
 	if policy := handlers.APIKeyPolicyFromContext(ctx); !policy.Empty() {
 		allModels := append([]string{model}, checkModels...)
 		for _, m := range allModels {
 			if requested := strings.TrimSpace(m); requested != "" && policy.DeniesModel(requested) {
+				auth.CleanupAcquiredSlot(opts.Metadata)
 				return nil, nil, &modelPolicyError{message: fmt.Sprintf("model %s is not allowed for this API key", requested)}
 			}
 		}
 	}
 	if errLimit := handlers.EnforceAPIKeyUsageLimit(ctx); errLimit != nil {
+		auth.CleanupAcquiredSlot(opts.Metadata)
 		return nil, nil, &liveUsageLimitError{err: errLimit.Error}
 	}
 	var selection *auth.HomeDispatchSelection
 	var selected *auth.Auth
 	var errSelect error
 	if h.authManager.HomeEnabled() {
-		selection, errSelect = h.authManager.SelectHomeAuthByKind(ctx, "codex", model, auth.AuthKindOAuth, opts)
+		selection, errSelect = h.authManager.SelectHomeAuthByKind(ctx, "codex", model, auth.AuthKindOAuth, *opts)
 		if selection != nil {
 			selected = selection.CloneAuth()
 		}
 	} else {
-		selected, errSelect = h.authManager.SelectAuthByKind(ctx, "codex", "", auth.AuthKindOAuth, opts)
+		selected, errSelect = h.authManager.SelectAuthByKind(ctx, "codex", "", auth.AuthKindOAuth, *opts)
 	}
-	if errSelect != nil && selection != nil {
-		selection.End("selection_failed")
+	if errSelect != nil {
+		auth.CleanupAcquiredSlot(opts.Metadata)
+		if selection != nil {
+			selection.End("selection_failed")
+		}
 	}
 	return selection, selected, errSelect
 }

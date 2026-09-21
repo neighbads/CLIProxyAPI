@@ -30,6 +30,7 @@ type routingRuntimeState struct {
 	sessionAffinity          bool
 	sessionAffinityTTL       time.Duration
 	sessionAffinitySubagents bool
+	hasAccountPolicies       bool
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -60,10 +61,11 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	if state.sessionAffinity && cfg.Routing.SessionAffinitySubagents != nil {
 		state.sessionAffinitySubagents = *cfg.Routing.SessionAffinitySubagents
 	}
+	state.hasAccountPolicies = len(cfg.AccountPolicies) > 0
 	return state
 }
 
-func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
+func newRoutingSelector(state routingRuntimeState, policies ...[]config.AccountPolicy) coreauth.Selector {
 	var selector coreauth.Selector
 	switch state.strategy {
 	case "weighted-round-robin":
@@ -73,13 +75,19 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
-	if state.sessionAffinity {
+	hasPolicies := len(policies) > 0 && len(policies[0]) > 0
+	if state.sessionAffinity || hasPolicies {
 		subagents := state.sessionAffinitySubagents
-		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+		affinitySel := coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
 			Fallback:         selector,
 			TTL:              state.sessionAffinityTTL,
 			SubagentAffinity: &subagents,
+			DisableAffinity:  !state.sessionAffinity,
 		})
+		if hasPolicies {
+			affinitySel.SetAccountPolicies(policies[0])
+		}
+		selector = affinitySel
 	}
 	return selector
 }
@@ -223,7 +231,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
 	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
-		s.coreManager.SetSelector(newRoutingSelector(routingState))
+		s.coreManager.SetSelector(newRoutingSelector(routingState, commit.cfg.AccountPolicies))
 		s.appliedRoutingState = &routingState
 	}
 	s.applyRetryConfig(commit.cfg)
