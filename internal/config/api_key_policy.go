@@ -37,6 +37,37 @@ func (l APIKeyUsageLimits) Normalized() APIKeyUsageLimits {
 	return l
 }
 
+// APIKeyRateLimits caps the in-flight concurrency and queueing behaviour for a client API key.
+type APIKeyRateLimits struct {
+	// MaxInFlight caps the number of active, in-flight requests the key may run concurrently.
+	// A non-positive value means unlimited.
+	MaxInFlight int `yaml:"max-in-flight,omitempty" json:"max-in-flight,omitempty"`
+
+	// QueueRetries is the number of exponential backoff retries (1s, 2s, 4s, 8s...) to wait
+	// for an in-flight slot before returning HTTP 429.
+	QueueRetries int `yaml:"queue-retries,omitempty" json:"queue-retries,omitempty"`
+}
+
+// Empty reports whether in-flight rate limits are unrestricted.
+func (l APIKeyRateLimits) Empty() bool {
+	return l.MaxInFlight <= 0
+}
+
+// Normalized clamps negative values to zero. If MaxInFlight is non-positive,
+// QueueRetries is also zeroed as queueing has no effect without an in-flight cap.
+func (l APIKeyRateLimits) Normalized() APIKeyRateLimits {
+	out := l
+	if out.MaxInFlight <= 0 {
+		out.MaxInFlight = 0
+		out.QueueRetries = 0
+		return out
+	}
+	if out.QueueRetries < 0 {
+		out.QueueRetries = 0
+	}
+	return out
+}
+
 // APIKeyPolicy restricts the models, provider configuration instances, upstream accounts,
 // and token usage a single client API key may consume. Every restriction is optional; an
 // empty list or a zero limit means the dimension is unrestricted for that key.
@@ -59,12 +90,15 @@ type APIKeyPolicy struct {
 
 	// UsageLimits caps the tokens the key may consume per calendar day and month.
 	UsageLimits APIKeyUsageLimits `yaml:"usage-limits,omitempty" json:"usage-limits,omitempty"`
+
+	// RateLimits caps the active in-flight requests and queue retries for the key.
+	RateLimits APIKeyRateLimits `yaml:"rate-limits,omitempty" json:"rate-limits,omitempty"`
 }
 
 // Empty reports whether the policy carries no restriction at all.
 func (p APIKeyPolicy) Empty() bool {
 	return len(p.ExcludedModels) == 0 && len(p.ExcludedAIProviders) == 0 && len(p.ExcludedAIAccounts) == 0 &&
-		p.UsageLimits.Empty()
+		p.UsageLimits.Empty() && p.RateLimits.Empty()
 }
 
 // APIKeyPolicySet is the compiled, immutable request-scoped view of one client API key's
@@ -78,6 +112,8 @@ type APIKeyPolicySet struct {
 	fingerprint       string
 	dailyTokenLimit   int64
 	monthlyTokenLimit int64
+	maxInFlight       int
+	queueRetries      int
 }
 
 // Empty reports whether the set carries no restriction, in which case all requests pass.
@@ -86,7 +122,7 @@ func (s *APIKeyPolicySet) Empty() bool {
 		return true
 	}
 	return len(s.excludedModels) == 0 && len(s.excludedProviders) == 0 && len(s.excludedAccounts) == 0 &&
-		!s.LimitsUsage()
+		!s.LimitsUsage() && !s.LimitsInFlight()
 }
 
 // LimitsUsage reports whether the set caps token consumption in any window.
@@ -95,6 +131,30 @@ func (s *APIKeyPolicySet) LimitsUsage() bool {
 		return false
 	}
 	return s.fingerprint != "" && (s.dailyTokenLimit > 0 || s.monthlyTokenLimit > 0)
+}
+
+// LimitsInFlight reports whether the set caps concurrent in-flight requests.
+func (s *APIKeyPolicySet) LimitsInFlight() bool {
+	if s == nil {
+		return false
+	}
+	return s.fingerprint != "" && s.maxInFlight > 0
+}
+
+// MaxInFlight returns the concurrent in-flight request limit, or 0 when unlimited.
+func (s *APIKeyPolicySet) MaxInFlight() int {
+	if s == nil {
+		return 0
+	}
+	return s.maxInFlight
+}
+
+// QueueRetries returns the number of queue retries to wait for an in-flight slot.
+func (s *APIKeyPolicySet) QueueRetries() int {
+	if s == nil {
+		return 0
+	}
+	return s.queueRetries
 }
 
 // Fingerprint returns the SHA-256 identifier the usage tracker accounts this key under.
@@ -250,6 +310,13 @@ func (cfg *SDKConfig) APIKeyPolicySetFor(apiKey string) *APIKeyPolicySet {
 			set.dailyTokenLimit = int64(limits.DailyTokensMB) * tokensPerMB
 			set.monthlyTokenLimit = int64(limits.MonthlyTokensMB) * tokensPerMB
 		}
+		if rates := entry.RateLimits.Normalized(); rates.MaxInFlight > 0 {
+			if set.fingerprint == "" {
+				set.fingerprint = misc.APIKeyFingerprint(key)
+			}
+			set.maxInFlight = rates.MaxInFlight
+			set.queueRetries = rates.QueueRetries
+		}
 		if len(entry.ExcludedAIProviders) > 0 {
 			set.excludedProviders = make(map[string]struct{}, len(entry.ExcludedAIProviders))
 			for _, value := range entry.ExcludedAIProviders {
@@ -293,6 +360,7 @@ func NormalizeAPIKeyPolicies(entries []APIKeyPolicy) []APIKeyPolicy {
 		entry.ExcludedAIProviders = normalizePolicyValues(entry.ExcludedAIProviders)
 		entry.ExcludedAIAccounts = normalizePolicyValues(entry.ExcludedAIAccounts)
 		entry.UsageLimits = entry.UsageLimits.Normalized()
+		entry.RateLimits = entry.RateLimits.Normalized()
 		if entry.Empty() {
 			continue
 		}

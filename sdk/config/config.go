@@ -24,6 +24,7 @@ type PayloadModelRule = internalconfig.PayloadModelRule
 
 type APIKeyPolicy = internalconfig.APIKeyPolicy
 type APIKeyPolicySet = internalconfig.APIKeyPolicySet
+type APIKeyRateLimits = internalconfig.APIKeyRateLimits
 
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
