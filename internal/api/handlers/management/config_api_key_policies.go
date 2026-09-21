@@ -53,6 +53,7 @@ func (h *Handler) PatchAPIKeyPolicies(c *gin.Context) {
 		ExcludedAIProviders *[]string                 `json:"excluded-ai-providers"`
 		ExcludedAIAccounts  *[]string                 `json:"excluded-ai-accounts"`
 		UsageLimits         *config.APIKeyUsageLimits `json:"usage-limits"`
+		RateLimits          *config.APIKeyRateLimits  `json:"rate-limits"`
 	}
 	var body struct {
 		APIKey              *string                   `json:"api-key"`
@@ -61,6 +62,7 @@ func (h *Handler) PatchAPIKeyPolicies(c *gin.Context) {
 		ExcludedAIProviders *[]string                 `json:"excluded-ai-providers"`
 		ExcludedAIAccounts  *[]string                 `json:"excluded-ai-accounts"`
 		UsageLimits         *config.APIKeyUsageLimits `json:"usage-limits"`
+		RateLimits          *config.APIKeyRateLimits  `json:"rate-limits"`
 		Value               *apiKeyPolicyPatch        `json:"value"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
@@ -83,6 +85,9 @@ func (h *Handler) PatchAPIKeyPolicies(c *gin.Context) {
 		}
 		if body.Value.UsageLimits != nil {
 			body.UsageLimits = body.Value.UsageLimits
+		}
+		if body.Value.RateLimits != nil {
+			body.RateLimits = body.Value.RateLimits
 		}
 	}
 
@@ -133,6 +138,9 @@ func (h *Handler) PatchAPIKeyPolicies(c *gin.Context) {
 	}
 	if body.UsageLimits != nil {
 		entry.UsageLimits = body.UsageLimits.Normalized()
+	}
+	if body.RateLimits != nil {
+		entry.RateLimits = body.RateLimits.Normalized()
 	}
 	if entry.APIKey == "" {
 		c.JSON(400, gin.H{"error": "missing api-key"})
