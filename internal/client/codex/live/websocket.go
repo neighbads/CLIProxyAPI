@@ -56,7 +56,9 @@ func (h *Handler) HandleDirectWebsocket(c *gin.Context) {
 	}
 	ctx := context.WithValue(c.Request.Context(), "gin", c)
 	ctx = coreexecutor.WithDownstreamWebsocket(ctx)
-	selectionOpts := coreexecutor.Options{Headers: liveSelectionHeaders(c)}
+	selectionOpts := &coreexecutor.Options{Headers: liveSelectionHeaders(c)}
+	selectionOpts.EnsureMetadata()
+	defer auth.CleanupAcquiredSlot(selectionOpts.Metadata)
 	ctx = handlers.EnrichContextWithSessionHierarchy(ctx, selectionOpts.Headers, nil, nil)
 	selection, selected, errSelect := h.selectOAuth(ctx, selectionModel, selectionOpts, requestedModel)
 	if errSelect != nil {
@@ -70,6 +72,15 @@ func (h *Handler) HandleDirectWebsocket(c *gin.Context) {
 		writeRealtimeError(c, http.StatusServiceUnavailable, "Codex auth unavailable", "server_error", "codex_auth_unavailable")
 		return
 	}
+	releaseAccountSlot, errSlot := h.authManager.AcquireAccountSlot(ctx, selected, selectionOpts.Metadata)
+	if errSlot != nil {
+		if selection != nil {
+			selection.End("account_busy")
+		}
+		writeSelectionError(c, errSlot)
+		return
+	}
+	defer releaseAccountSlot()
 	if selection != nil && selection.CanonicalSessionID != "" {
 		meta := logging.GetClientRequestMetadata(ctx)
 		meta.SessionID = selection.CanonicalSessionID

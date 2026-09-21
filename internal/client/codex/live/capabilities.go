@@ -73,17 +73,20 @@ func (h *Handler) HandleHangup(c *gin.Context) {
 	var activeSelection *auth.HomeDispatchSelection
 	var temporarySelection bool
 	var selected *auth.Auth
+	var selectionOpts *coreexecutor.Options
 	if session.homeSelection != nil && session.homeSelection.Active() {
 		activeSelection = session.homeSelection
 		selected = activeSelection.CloneAuth()
 	} else {
-		selectionOpts := coreexecutor.Options{
+		selectionOpts = &coreexecutor.Options{
 			Headers: liveSelectionHeaders(c),
 			Metadata: map[string]any{
 				coreexecutor.PinnedAuthMetadataKey:       session.authID,
 				coreexecutor.ExecutionSessionMetadataKey: callID,
 			},
 		}
+		selectionOpts.EnsureMetadata()
+		defer auth.CleanupAcquiredSlot(selectionOpts.Metadata)
 		selection, selectedAuth, errSelect := h.selectOAuth(ctx, session.model, selectionOpts)
 		if errSelect != nil {
 			writeSelectionError(c, errSelect)
@@ -163,7 +166,11 @@ func (h *Handler) HandleHangup(c *gin.Context) {
 			AuthType:  authType,
 			AuthValue: authValue,
 		})
-		return h.authManager.HttpRequest(ctx, current, request)
+		var reqMeta map[string]any
+		if selectionOpts != nil {
+			reqMeta = selectionOpts.Metadata
+		}
+		return h.authManager.HttpRequestWithMetadata(ctx, current, request, reqMeta)
 	}
 	response, errRequest := performRequest(selected)
 	if errRequest != nil {

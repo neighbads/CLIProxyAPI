@@ -369,6 +369,7 @@ func (h *Handler) HandleSideband(c *gin.Context) {
 	var selection *auth.HomeDispatchSelection
 	var selected *auth.Auth
 	var errSelect error
+	var selectionOpts *coreexecutor.Options
 	if session.homeSelection != nil {
 		if !session.homeSelection.Active() {
 			consumeSession = true
@@ -378,13 +379,15 @@ func (h *Handler) HandleSideband(c *gin.Context) {
 		selection = session.homeSelection
 		selected = selection.CloneAuth()
 	} else {
-		selectionOpts := coreexecutor.Options{
+		selectionOpts = &coreexecutor.Options{
 			Headers: liveSelectionHeaders(c),
 			Metadata: map[string]any{
 				coreexecutor.PinnedAuthMetadataKey:       session.authID,
 				coreexecutor.ExecutionSessionMetadataKey: callID,
 			},
 		}
+		selectionOpts.EnsureMetadata()
+		defer auth.CleanupAcquiredSlot(selectionOpts.Metadata)
 		selection, selected, errSelect = h.selectOAuth(ctx, session.model, selectionOpts)
 	}
 	if errSelect != nil {
@@ -407,6 +410,17 @@ func (h *Handler) HandleSideband(c *gin.Context) {
 	if selected == nil {
 		writeLiveError(c, http.StatusServiceUnavailable, "Codex auth unavailable")
 		return
+	}
+	if selectionOpts != nil {
+		releaseAccountSlot, errSlot := h.authManager.AcquireAccountSlot(ctx, selected, selectionOpts.Metadata)
+		if errSlot != nil {
+			if selection != nil {
+				selection.End("account_busy")
+			}
+			writeSelectionError(c, errSlot)
+			return
+		}
+		defer releaseAccountSlot()
 	}
 
 	if selection != nil {

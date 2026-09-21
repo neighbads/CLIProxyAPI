@@ -151,3 +151,13 @@ func TestTrackerUnlimitedBypass(t *testing.T) {
 	}
 	rel()
 }
+
+func TestAccountTrackerInstance(t *testing.T) {
+	tr := AccountTracker()
+	if tr == nil {
+		t.Fatal("AccountTracker() returned nil")
+	}
+	if tr != AccountTracker() {
+		t.Fatal("AccountTracker() should return singleton instance")
+	}
+}
