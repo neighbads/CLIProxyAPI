@@ -139,10 +139,16 @@ func New(baseInterval time.Duration) *Tracker {
 }
 
 var defaultTracker = New(time.Second)
+var accountTracker = New(time.Second)
 
 // Default returns the process-wide default Tracker.
 func Default() *Tracker {
 	return defaultTracker
+}
+
+// AccountTracker returns the process-wide Tracker for upstream accounts.
+func AccountTracker() *Tracker {
+	return accountTracker
 }
 
 func (t *Tracker) getLimiter(fingerprint string) *keyLimiter {

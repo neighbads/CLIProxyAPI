@@ -196,6 +196,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// bad policy can never disable authentication for the remaining keys.
 	cfg.APIKeyPolicies = NormalizeAPIKeyPolicies(cfg.APIKeyPolicies)
 
+	// Normalize upstream account policies.
+	cfg.AccountPolicies = NormalizeAccountPolicies(cfg.AccountPolicies)
+
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
