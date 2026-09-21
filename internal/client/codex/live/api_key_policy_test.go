@@ -183,7 +183,7 @@ func TestSelectOAuthAttachesAPIKeyPolicyMetadata(t *testing.T) {
 	t.Run("no policy offers every credential", func(t *testing.T) {
 		ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 		ctx := context.WithValue(context.Background(), "gin", ginCtx)
-		if _, _, errSelect := handler.selectOAuth(ctx, "gpt-live-1-codex", coreexecutor.Options{}); errSelect != nil {
+		if _, _, errSelect := handler.selectOAuth(ctx, "gpt-live-1-codex", &coreexecutor.Options{}); errSelect != nil {
 			t.Fatalf("selectOAuth() error = %v", errSelect)
 		}
 		offered := selector.offeredIDs()
@@ -198,7 +198,7 @@ func TestSelectOAuthAttachesAPIKeyPolicyMetadata(t *testing.T) {
 		ginCtx.Set(handlers.APIKeyPolicyContextKey, policy)
 		ctx := context.WithValue(context.Background(), "gin", ginCtx)
 
-		_, selectedAuth, errSelect := handler.selectOAuth(ctx, "gpt-live-1-codex", coreexecutor.Options{})
+		_, selectedAuth, errSelect := handler.selectOAuth(ctx, "gpt-live-1-codex", &coreexecutor.Options{})
 		if errSelect != nil {
 			t.Fatalf("selectOAuth() error = %v", errSelect)
 		}
@@ -223,7 +223,7 @@ func TestSelectOAuthAttachesAPIKeyPolicyMetadata(t *testing.T) {
 		ginCtx.Set(handlers.APIKeyPolicyContextKey, policy)
 		ctx := context.WithValue(context.Background(), "gin", ginCtx)
 
-		_, _, errSelect := handler.selectOAuth(ctx, "gpt-live-blocked", coreexecutor.Options{})
+		_, _, errSelect := handler.selectOAuth(ctx, "gpt-live-blocked", &coreexecutor.Options{})
 		if errSelect == nil {
 			t.Fatal("selectOAuth() want error for excluded model, got nil")
 		}
@@ -242,7 +242,7 @@ func TestSelectOAuthAttachesAPIKeyPolicyMetadata(t *testing.T) {
 		ctx := context.WithValue(context.Background(), "gin", ginCtx)
 
 		// "gpt-realtime" is the raw model, while "gpt-live-1-codex" is the internal selection model
-		_, _, errSelect := handler.selectOAuth(ctx, "gpt-live-1-codex", coreexecutor.Options{}, "gpt-realtime")
+		_, _, errSelect := handler.selectOAuth(ctx, "gpt-live-1-codex", &coreexecutor.Options{}, "gpt-realtime")
 		if errSelect == nil {
 			t.Fatal("selectOAuth() want error for excluded raw model, got nil")
 		}
@@ -265,7 +265,7 @@ func TestSelectOAuthAttachesAPIKeyPolicyMetadata(t *testing.T) {
 		ginCtx.Set(handlers.APIKeyPolicyContextKey, policy)
 		ctx := context.WithValue(context.Background(), "gin", ginCtx)
 
-		_, _, errSelect := handler.selectOAuth(ctx, "gpt-live-1-codex", coreexecutor.Options{})
+		_, _, errSelect := handler.selectOAuth(ctx, "gpt-live-1-codex", &coreexecutor.Options{})
 		if errSelect == nil {
 			t.Fatal("selectOAuth() want error for exceeded usage limit, got nil")
 		}
