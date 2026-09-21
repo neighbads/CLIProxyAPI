@@ -9,6 +9,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/ratelimit"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -130,6 +131,17 @@ func isExampleAPIKeySafeModeProxyPath(path string) bool {
 	}
 }
 
+func isRateLimitExemptPath(c *gin.Context) bool {
+	if c == nil || c.Request == nil || c.Request.URL == nil {
+		return false
+	}
+	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+		return false
+	}
+	clean := strings.TrimRight(c.Request.URL.Path, "/")
+	return clean == "/v1/models" || clean == "/v1beta/models"
+}
+
 // corsMiddleware returns a Gin middleware handler that adds CORS headers
 // to every response, allowing cross-origin requests.
 //
@@ -166,6 +178,40 @@ func realtimeStandardAuthMiddleware(manager *sdkaccess.Manager, policyResolver A
 	return accessAuthMiddleware(manager, policyResolver, true)
 }
 
+func applyInFlightRateLimit(c *gin.Context, policyResolver APIKeyPolicyResolver, principal string, realtimeError bool) (func(), bool) {
+	if policyResolver == nil {
+		return func() {}, true
+	}
+	policy := policyResolver(principal)
+	if policy.Empty() {
+		return func() {}, true
+	}
+	c.Set(apiKeyPolicyContextKey, policy)
+	if !policy.LimitsInFlight() || isRateLimitExemptPath(c) {
+		return func() {}, true
+	}
+	release, errLimit := ratelimit.Default().Acquire(c.Request.Context(), policy.Fingerprint(), policy.MaxInFlight(), policy.QueueRetries())
+	if errLimit != nil {
+		c.Header("Retry-After", "1")
+		if realtimeError {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": gin.H{
+				"message": errLimit.Error(),
+				"type":    "rate_limit_error",
+				"param":   nil,
+				"code":    "rate_limit_exceeded",
+			}})
+			return nil, false
+		}
+		c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": gin.H{
+			"message": errLimit.Error(),
+			"type":    "requests",
+			"code":    "rate_limit_exceeded",
+		}})
+		return nil, false
+	}
+	return release, true
+}
+
 func accessAuthMiddleware(manager *sdkaccess.Manager, policyResolver APIKeyPolicyResolver, realtimeError bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if manager == nil {
@@ -181,13 +227,11 @@ func accessAuthMiddleware(manager *sdkaccess.Manager, policyResolver APIKeyPolic
 				if len(result.Metadata) > 0 {
 					c.Set("accessMetadata", result.Metadata)
 				}
-				// The policy is derived from the authenticated principal, so a client
-				// cannot inject restrictions by sending an identically named field.
-				if policyResolver != nil {
-					if policy := policyResolver(result.Principal); !policy.Empty() {
-						c.Set(apiKeyPolicyContextKey, policy)
-					}
+				release, ok := applyInFlightRateLimit(c, policyResolver, result.Principal, realtimeError)
+				if !ok {
+					return
 				}
+				defer release()
 			}
 			c.Next()
 			return
@@ -245,6 +289,11 @@ func realtimeAuthMiddleware(manager *sdkaccess.Manager, handler *codexlive.Handl
 		c.Set("accessProvider", provider)
 		c.Set(codexlive.ClientSecretSessionContextKey, authorization.Session)
 		c.Set(codexlive.ClientSecretPrincipalContextKey, authorization.Principal)
+		release, ok := applyInFlightRateLimit(c, policyResolver, principal, true)
+		if !ok {
+			return
+		}
+		defer release()
 		c.Next()
 	}
 }

@@ -73,6 +73,13 @@ api-keys:
 #     usage-limits:
 #       daily-tokens-mb: 200
 #       monthly-tokens-mb: 4000
+#     # In-flight concurrency limits and queue retry backoff.
+#     # max-in-flight caps simultaneous active requests for this key.
+#     # queue-retries defines how many exponential backoff attempts (1s, 2s, 4s, 8s...)
+#     # the request will wait in queue for an available slot before returning HTTP 429.
+#     rate-limits:
+#       max-in-flight: 5
+#       queue-retries: 4
 
 # Enable debug logging
 debug: false
