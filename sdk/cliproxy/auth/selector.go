@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -14,13 +15,16 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/ratelimit"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
@@ -982,6 +986,12 @@ type SessionAffinitySelector struct {
 	cache            *SessionCache
 	matcher          *cliproxysession.MerklePrefixMatcher
 	subagentAffinity bool
+	disableAffinity  bool
+	hasPolicies      atomic.Bool
+	policiesMu       sync.RWMutex
+	accountPolicies  []internalconfig.AccountPolicy
+	accountTracker   *ratelimit.Tracker
+	policyResolver   func(provider, authID string, emails ...string) *internalconfig.AccountPolicy
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -989,6 +999,10 @@ type SessionAffinityConfig struct {
 	Fallback         Selector
 	TTL              time.Duration
 	SubagentAffinity *bool
+	DisableAffinity  bool
+	AccountPolicies  []internalconfig.AccountPolicy
+	AccountTracker   *ratelimit.Tracker
+	PolicyResolver   func(provider, authID string, emails ...string) *internalconfig.AccountPolicy
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -1011,12 +1025,184 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.SubagentAffinity != nil {
 		subagentAffinity = *cfg.SubagentAffinity
 	}
-	return &SessionAffinitySelector{
+	sel := &SessionAffinitySelector{
 		fallback:         cfg.Fallback,
 		cache:            NewSessionCache(cfg.TTL),
 		matcher:          cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
 		subagentAffinity: subagentAffinity,
+		disableAffinity:  cfg.DisableAffinity,
+		accountPolicies:  cfg.AccountPolicies,
+		accountTracker:   cfg.AccountTracker,
+		policyResolver:   cfg.PolicyResolver,
 	}
+	sel.hasPolicies.Store(len(cfg.AccountPolicies) > 0 || cfg.PolicyResolver != nil)
+	return sel
+}
+
+// SetAccountPolicies updates the account policies used for concurrency limiting and spillover.
+func (s *SessionAffinitySelector) SetAccountPolicies(policies []internalconfig.AccountPolicy) {
+	if s == nil {
+		return
+	}
+	s.policiesMu.Lock()
+	defer s.policiesMu.Unlock()
+	s.accountPolicies = policies
+	s.hasPolicies.Store(len(policies) > 0 || s.policyResolver != nil)
+}
+
+// SetAccountTracker updates the ratelimit tracker used for concurrency limiting and spillover.
+func (s *SessionAffinitySelector) SetAccountTracker(tracker *ratelimit.Tracker) {
+	if s == nil {
+		return
+	}
+	s.policiesMu.Lock()
+	defer s.policiesMu.Unlock()
+	s.accountTracker = tracker
+}
+
+// SetPolicyResolver updates the policy resolution function.
+func (s *SessionAffinitySelector) SetPolicyResolver(resolver func(provider, authID string, emails ...string) *internalconfig.AccountPolicy) {
+	if s == nil {
+		return
+	}
+	s.policiesMu.Lock()
+	defer s.policiesMu.Unlock()
+	s.policyResolver = resolver
+	s.hasPolicies.Store(resolver != nil || len(s.accountPolicies) > 0)
+}
+
+func (s *SessionAffinitySelector) resolvePolicy(ctx context.Context, auth *Auth) *internalconfig.AccountPolicy {
+	if auth == nil {
+		return &internalconfig.AccountPolicy{}
+	}
+	if s != nil {
+		s.policiesMu.RLock()
+		resolver := s.policyResolver
+		policies := s.accountPolicies
+		s.policiesMu.RUnlock()
+
+		if resolver != nil {
+			if p := resolver(auth.Provider, auth.ID, authAccountEmail(auth)); p != nil {
+				return p
+			}
+		}
+		if len(policies) > 0 {
+			cfg := &internalconfig.SDKConfig{AccountPolicies: policies}
+			return cfg.AccountPolicyFor(auth.Provider, auth.ID, authAccountEmail(auth))
+		}
+	}
+	if ctx != nil {
+		if ctxPolicies := accountPoliciesFromContext(ctx); len(ctxPolicies) > 0 {
+			cfg := &internalconfig.SDKConfig{AccountPolicies: ctxPolicies}
+			return cfg.AccountPolicyFor(auth.Provider, auth.ID, authAccountEmail(auth))
+		}
+	}
+	return &internalconfig.AccountPolicy{}
+}
+
+func (s *SessionAffinitySelector) getTracker(ctx context.Context) *ratelimit.Tracker {
+	if s != nil {
+		s.policiesMu.RLock()
+		t := s.accountTracker
+		s.policiesMu.RUnlock()
+		if t != nil {
+			return t
+		}
+	}
+	if ctx != nil {
+		if t := accountTrackerFromContext(ctx); t != nil {
+			return t
+		}
+	}
+	return ratelimit.AccountTracker()
+}
+
+func (s *SessionAffinitySelector) hasAccountPolicies(ctx context.Context) bool {
+	if s != nil && s.hasPolicies.Load() {
+		return true
+	}
+	if ctx != nil {
+		if ctxPolicies := accountPoliciesFromContext(ctx); len(ctxPolicies) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *SessionAffinitySelector) pickFallbackWithSpillover(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth) (*Auth, error) {
+	if len(available) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+	}
+
+	// Backward compatibility fast-path: when no account policies configured, behavior remains 100% identical.
+	if !s.hasAccountPolicies(ctx) {
+		fallbackAuths := highestPriorityAuths(available)
+		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	}
+
+	tracker := s.getTracker(ctx)
+
+	// Group candidates by priority
+	tiers := make(map[int][]*Auth)
+	var priorities []int
+	for _, auth := range available {
+		if auth == nil {
+			continue
+		}
+		p := authPriority(auth)
+		if len(tiers[p]) == 0 {
+			priorities = append(priorities, p)
+		}
+		tiers[p] = append(tiers[p], auth)
+	}
+
+	if len(priorities) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+	}
+
+	// Sort priorities descending (highest priority first)
+	sort.Slice(priorities, func(i, j int) bool { return priorities[i] > priorities[j] })
+
+	for _, priority := range priorities {
+		tierAuths := tiers[priority]
+
+		// 1. Prefer non-busy accounts (InFlight < MaxInFlight) in this priority tier
+		var nonBusyAuths []*Auth
+		for _, auth := range tierAuths {
+			policy := s.resolvePolicy(ctx, auth)
+			if policy.RateLimits.MaxInFlight <= 0 || tracker.InFlight(auth.ID) < policy.RateLimits.MaxInFlight {
+				nonBusyAuths = append(nonBusyAuths, auth)
+			}
+		}
+
+		if len(nonBusyAuths) > 0 {
+			return s.fallback.Pick(ctx, provider, model, opts, nonBusyAuths)
+		}
+
+		// 2. All accounts in this priority tier are busy: attempt queueing or spillover upon timeout
+		cand, errPick := s.fallback.Pick(ctx, provider, model, opts, tierAuths)
+		if errPick != nil {
+			return nil, errPick
+		}
+		policy := s.resolvePolicy(ctx, cand)
+		release, errAcq := tracker.Acquire(ctx, cand.ID, policy.RateLimits.MaxInFlight, policy.RateLimits.QueueRetries)
+		if errAcq == nil {
+			storePreAcquiredSlot(opts.Metadata, cand.ID, release)
+			return cand, nil
+		}
+		if errors.Is(errAcq, ratelimit.ErrRateLimitExceeded) {
+			entry := selectorLogEntry(ctx)
+			entry.Infof("session-affinity: priority tier %d busy and queue retries exhausted, spilling over to next tier | provider=%s model=%s", priority, provider, model)
+			continue
+		}
+		if ctx != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, errAcq
+	}
+
+	// All priority tiers exhausted
+	return nil, ratelimit.ErrRateLimitExceeded
 }
 
 // Trees returns a backward-compatible in-memory session tree store.
@@ -1039,6 +1225,17 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	if s.disableAffinity {
+		availabilityCandidates := auths
+		if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
+			availabilityCandidates = positiveWeightAuths(auths)
+		}
+		available, errAvailable := getSelectorAvailableAuthsAcrossPriorities(ctx, availabilityCandidates, provider, model, time.Now())
+		if errAvailable != nil {
+			return nil, errAvailable
+		}
+		return s.pickFallbackWithSpillover(ctx, provider, model, opts, available)
+	}
 	entry := selectorLogEntry(ctx)
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
@@ -1085,12 +1282,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
 	if primaryID == "" {
-		fallbackAuths, errAvailable := getSelectorAvailableAuths(ctx, availabilityCandidates, provider, model, now)
+		available, errAvailable := getSelectorAvailableAuthsAcrossPriorities(ctx, availabilityCandidates, provider, model, now)
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		return s.pickFallbackWithSpillover(ctx, provider, model, opts, available)
 	}
 
 	// A single availability pass serves both lookups: the bound credential is validated against
@@ -1099,7 +1296,6 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
-	fallbackAuths := highestPriorityAuths(available)
 
 	modelKey := canonicalModelKey(model)
 	cacheKey := provider + "::" + primaryID + "::" + modelKey
@@ -1125,13 +1321,36 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				policy := s.resolvePolicy(ctx, auth)
+				tracker := s.getTracker(ctx)
+				if policy.RateLimits.MaxInFlight > 0 && tracker.InFlight(cachedAuthID) >= policy.RateLimits.MaxInFlight {
+					release, errAcq := tracker.Acquire(ctx, cachedAuthID, policy.RateLimits.MaxInFlight, policy.RateLimits.QueueRetries)
+					if errAcq == nil {
+						storePreAcquiredSlot(opts.Metadata, cachedAuthID, release)
+						bind(auth.ID)
+						entry.Infof("session-affinity: cache hit (slot acquired) | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+						return auth, nil
+					}
+					if errors.Is(errAcq, ratelimit.ErrRateLimitExceeded) {
+						s.cache.CompareAndDelete(cacheKey, cachedAuthID)
+						if fallbackKey != "" && !isSubagent && !isFork {
+							s.cache.CompareAndDelete(fallbackKey, cachedAuthID)
+						}
+						entry.Infof("session-affinity: cache hit but queue retries exhausted, unbound session | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
+						break
+					}
+					if ctx != nil && ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					return nil, errAcq
+				}
 				bind(auth.ID)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		// Cached auth not available or queue retries exhausted, reselect via fallback selector with spillover
+		auth, err := s.pickFallbackWithSpillover(ctx, provider, model, opts, available)
 		if err != nil {
 			return nil, err
 		}
@@ -1148,6 +1367,31 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
 					if !isSubagent || s.subagentAffinity {
+						policy := s.resolvePolicy(ctx, auth)
+						tracker := s.getTracker(ctx)
+						if policy.RateLimits.MaxInFlight > 0 && tracker.InFlight(cachedAuthID) >= policy.RateLimits.MaxInFlight {
+							release, errAcq := tracker.Acquire(ctx, cachedAuthID, policy.RateLimits.MaxInFlight, policy.RateLimits.QueueRetries)
+							if errAcq == nil {
+								storePreAcquiredSlot(opts.Metadata, cachedAuthID, release)
+								bind(auth.ID)
+								if isFork {
+									entry.Infof("session-affinity: fork cache hit (slot acquired) | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+								} else {
+									entry.Infof("session-affinity: fallback cache hit (slot acquired) | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+								}
+								return auth, nil
+							}
+							if errors.Is(errAcq, ratelimit.ErrRateLimitExceeded) {
+								if !isSubagent && !isFork {
+									s.cache.CompareAndDelete(fallbackKey, cachedAuthID)
+								}
+								break
+							}
+							if ctx != nil && ctx.Err() != nil {
+								return nil, ctx.Err()
+							}
+							return nil, errAcq
+						}
 						bind(auth.ID)
 						if isFork {
 							entry.Infof("session-affinity: fork cache hit | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
@@ -1161,7 +1405,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, err := s.pickFallbackWithSpillover(ctx, provider, model, opts, available)
 	if err != nil {
 		return nil, err
 	}
@@ -1212,6 +1456,20 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 			if auth == nil || auth.ID != match.AuthID {
 				continue
 			}
+			policy := s.resolvePolicy(ctx, auth)
+			tracker := s.getTracker(ctx)
+			if policy.RateLimits.MaxInFlight > 0 && tracker.InFlight(auth.ID) >= policy.RateLimits.MaxInFlight {
+				release, errAcq := tracker.Acquire(ctx, auth.ID, policy.RateLimits.MaxInFlight, policy.RateLimits.QueueRetries)
+				if errAcq == nil {
+					storePreAcquiredSlot(opts.Metadata, auth.ID, release)
+				} else if errors.Is(errAcq, ratelimit.ErrRateLimitExceeded) {
+					break
+				} else if ctx != nil && ctx.Err() != nil {
+					return nil, true, ctx.Err()
+				} else {
+					return nil, true, errAcq
+				}
+			}
 			if match.SessionID != "" {
 				opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = match.SessionID
 				opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = match.SessionID
@@ -1239,8 +1497,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		}
 	}
 
-	fallbackAuths := highestPriorityAuths(available)
-	auth, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, errPick := s.pickFallbackWithSpillover(ctx, provider, model, opts, available)
 	if errPick != nil {
 		return nil, true, errPick
 	}

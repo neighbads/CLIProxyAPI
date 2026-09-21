@@ -73,6 +73,27 @@ api-keys:
 #       max-in-flight: 5
 #       queue-retries: 4
 
+# Upstream OAuth and API account concurrency and queueing policies.
+# Controls in-flight concurrency per account and queue retry backoff, enabling
+# non-busy account preference, session affinity queue protection, and tiered spillover.
+# Matches by auth-id (exact or wildcard "*"), provider (e.g. "claude", "codex"), or default: true.
+# account-policies:
+#   # 1. Match all accounts under a specific provider
+#   - provider: "claude"
+#     rate-limits:
+#       max-in-flight: 2
+#       queue-retries: 4          # 1s, 2s, 4s, 8s (max 15s wait; slot release wakes up immediately)
+#   # 2. Match accounts by auth-id / email with wildcards
+#   - auth-id: "*team*"
+#     rate-limits:
+#       max-in-flight: 5
+#       queue-retries: 4
+#   # 3. Global default fallback
+#   - default: true
+#     rate-limits:
+#       max-in-flight: 2
+#       queue-retries: 4
+
 # Enable debug logging
 debug: false
 
