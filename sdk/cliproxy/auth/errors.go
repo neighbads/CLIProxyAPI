@@ -30,6 +30,12 @@ const transientTransportErrorCode = ErrorCodeTransientTransport
 // ErrorCodeForceCooldown marks failures that must enforce credential cooldown.
 const ErrorCodeForceCooldown = "force_cooldown"
 
+// ErrorCodeAccountRateLimitExceeded marks account in-flight concurrency saturation failures
+// that must skip credential cooldown (temporary local busy, not upstream 429).
+const ErrorCodeAccountRateLimitExceeded = "account_rate_limit_exceeded"
+
+const rateLimitExceededErrorCode = ErrorCodeAccountRateLimitExceeded
+
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.

@@ -380,6 +380,7 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 	// This endpoint selects a credential itself instead of going through the shared handler
 	// execution chain, so the authenticated client key's policy has to be attached here.
 	selectionOpts.EnsureMetadata()
+	defer auth.CleanupAcquiredSlot(selectionOpts.Metadata)
 	s.handlers.AttachAPIKeyPolicyMetadata(c, selectionOpts.Metadata)
 	var selection *auth.HomeDispatchSelection
 	var selected *auth.Auth
@@ -486,7 +487,7 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 			AuthType:  authType,
 			AuthValue: authValue,
 		})
-		return s.handlers.AuthManager.HttpRequest(ctx, current, req)
+		return s.handlers.AuthManager.HttpRequestWithMetadata(ctx, current, req, selectionOpts.Metadata)
 	}
 
 	if errCtx := ctx.Err(); errCtx != nil {

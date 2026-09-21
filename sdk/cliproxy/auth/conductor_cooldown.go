@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/ratelimit"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -161,6 +162,12 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 		m.homeSessionAliases.clear()
 	}
 	m.runtimeConfig.Store(cfg)
+	m.mu.RLock()
+	sel := m.selector
+	m.mu.RUnlock()
+	if aware, ok := sel.(accountPoliciesAwareSelector); ok {
+		aware.SetAccountPolicies(cfg.AccountPolicies)
+	}
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if clearedCooldowns && oldCooldownStore != nil {
 		m.mu.Lock()
@@ -1500,8 +1507,35 @@ func resultErrorFromError(err error) *Error {
 		if resultErr.Code == "" || resultErr.Code == transientTransportErrorCode {
 			resultErr.Code = transientTransportErrorCode
 		}
+	case isRateLimitExceededError(err):
+		if resultErr.Code == "" || resultErr.Code == rateLimitExceededErrorCode {
+			resultErr.Code = rateLimitExceededErrorCode
+		}
 	}
 	return resultErr
+}
+
+func isRateLimitExceededError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if statusCodeFromError(err) != 0 {
+		return false
+	}
+	return errors.Is(err, ratelimit.ErrRateLimitExceeded)
+}
+
+func isRateLimitExceededResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if statusCodeFromResult(err) != 0 {
+		return false
+	}
+	if err.Code == rateLimitExceededErrorCode {
+		return true
+	}
+	return isRateLimitExceededError(err)
 }
 
 // shouldSkipCredentialCooldown reports failures that must not mark auth/model cooling.
@@ -1511,7 +1545,7 @@ func shouldSkipCredentialCooldown(err *Error) bool {
 	if err != nil && err.Code == ErrorCodeForceCooldown {
 		return false
 	}
-	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) || isTransientTransportResultError(err)
+	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) || isTransientTransportResultError(err) || isRateLimitExceededResultError(err)
 }
 
 // isConnectionLifecycleError reports transport/session lifecycle failures that must

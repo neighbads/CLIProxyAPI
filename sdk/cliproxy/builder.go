@@ -262,7 +262,11 @@ func (b *Builder) Build() (*Service, error) {
 		}
 
 		routingState := normalizedRoutingRuntimeState(b.cfg)
-		coreManager = coreauth.NewManager(tokenStore, newRoutingSelector(routingState), nil)
+		var accountPolicies []config.AccountPolicy
+		if b.cfg != nil {
+			accountPolicies = b.cfg.AccountPolicies
+		}
+		coreManager = coreauth.NewManager(tokenStore, newRoutingSelector(routingState, accountPolicies), nil)
 		appliedRoutingState = &routingState
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
