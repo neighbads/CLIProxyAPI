@@ -85,6 +85,8 @@ func (s *Server) setupRoutes() {
 		v1.POST("/alpha/search", s.codexAlphaSearch)
 		v1.POST("/live", s.codexLiveHandler.Handle)
 		v1.GET("/live/:call_id", s.codexLiveHandler.HandleSideband)
+		v1.POST("/systemone", s.handleSystemOne)
+		v1.POST("/decisions", s.handleDecisions)
 	}
 
 	realtimeAuth := realtimeAuthMiddleware(s.accessManager, s.codexLiveHandler, s.apiKeyPolicyResolver)
